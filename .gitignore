@@ -22,9 +22,11 @@ sqlite3
 sqlite3.pc
 src-verify
 .tclenv.sh
-testdir/
+testdir*/
 has_tclsh85
 pkgIndex.tcl
 testfixture
+testrunner.db
+testrunner.log
 tclsqlite3
 .DS_Store
