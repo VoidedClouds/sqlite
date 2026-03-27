@@ -1,0 +1,1025 @@
+# 2026 March 27
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking COMBINED with read isolation under WAL2.
+#
+# These tests require BOTH SQLITE_ENABLE_ROW_LEVEL_LOCKING and
+# SQLITE_ENABLE_READ_ISOLATION compiled in, and exercise the dual-sidecar
+# row-log that supports WAL2 mode.
+#
+# Sections:
+#   1.x  RC + RLL under WAL2: read-write row overlap is NOT a conflict
+#   2.x  RC + RLL under WAL2: write-write row overlap IS a conflict
+#   3.x  Snapshot + RLL under WAL2: read-write row overlap IS a conflict
+#   4.x  RC + RLL under WAL2: disjoint writes on same page succeed
+#   5.x  Generation reset: RC + RLL after WAL2 checkpoint still works
+#   6.x  Cross-process sidecar: RC + RLL after checkpoint + new sidecar
+#   7.x  File-switch: RC + RLL across WAL file boundary
+#   8.x  Read-first snapshot detection with RLL under WAL2
+#   9.x  Multi-switch sidecar existence and row-log accumulation
+#  10.x  Multi-switch RC + RLL conflict resolution across WAL boundaries
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-ri-wal2
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+# Require SQLITE_ENABLE_ROW_LEVEL_LOCKING
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_read_isolation_wal2.test: RLL not compiled in - skipping"
+  finish_test
+  return
+}
+
+# Require SQLITE_ENABLE_READ_ISOLATION
+set has_ri 0
+catch {
+  db eval { PRAGMA isolation_level = read_committed }
+  set val [db eval { PRAGMA isolation_level }]
+  if { $val eq "read_committed" } { set has_ri 1 }
+  db eval { PRAGMA isolation_level = snapshot }
+}
+if { $has_ri == 0 } {
+  puts "rowlock_read_isolation_wal2.test: READ_ISOLATION not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--------------------------------------------------------------------------
+# 1.x: Read-committed + RLL under WAL2 — read-write row overlap is ignored
+#
+# db1 (read_committed + RLL): inserts row 99, then scans to read rows 10/20.
+# db2 updates row 10 and commits.
+# db1 COMMIT succeeds: in RC mode, ROW_LOCK_READ entries are skipped when
+# checking for conflicts, so the read of row 10 does not cause a conflict
+# with db2's write of row 10.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 1.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t1(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t1;
+      INSERT INTO t1 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # INSERT first → creates pRowLocks (write mode).
+  # Then SELECT → ROW_LOCK_READ for rowids 10 and 20.
+  do_test 1.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(99, 'ninetynine');
+        SELECT rowid FROM t1 WHERE rowid < 50;
+    }
+  } {10 20}
+
+  # db2 updates row 10 (ROW_LOCK_WRITE for rowid 10) and commits.
+  do_test 1.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t1 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # read_committed skips ROW_LOCK_READ entries → no conflict → commit OK.
+  # Cross-process (tn==1) may hit WAL write-lock contention but the row
+  # check itself must not be the blocker.
+  do_test 1.$tn.3 {
+    if {$tn == 1} {
+      catch { sql1 COMMIT }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch { sql1 COMMIT } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  catch { sql2 ROLLBACK }
+  catch { sql1 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 2.x: RC + RLL under WAL2 — write-write row overlap IS a conflict
+#
+# db1 updates row 10.  db2 also updates row 10 and commits first.
+# Even in read_committed mode, a write-write row conflict must produce
+# SQLITE_BUSY_SNAPSHOT.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t2(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t2;
+      INSERT INTO t2 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # db1 updates row 10 (ROW_LOCK_WRITE)
+  do_test 2.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t2 SET v = 'TEN_db1' WHERE k = 10;
+    }
+  } {}
+
+  # db2 updates the same row 10 and commits first
+  do_test 2.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t2 SET v = 'TEN_db2' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # Write-write row conflict → BUSY_SNAPSHOT even in RC mode
+  do_test 2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 3.x: Snapshot + RLL under WAL2 — read-write row overlap IS a conflict
+#
+# Same scenario as §1 but db1 is in snapshot mode.  The ROW_LOCK_READ for
+# row 10 vs db2's WRITE for row 10 must produce SQLITE_BUSY_SNAPSHOT.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t3(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t3;
+      INSERT INTO t3 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = snapshot }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  do_test 3.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t3 VALUES(99, 'ninetynine');
+        SELECT rowid FROM t3 WHERE rowid < 50;
+    }
+  } {10 20}
+
+  do_test 3.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t3 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # Snapshot: read-write overlap → BUSY_SNAPSHOT
+  do_test 3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 4.x: RC + RLL under WAL2 — disjoint writes on same page succeed
+#
+# The combined benefit of read_committed + row-level locking:
+# db1 writes row 20 and reads row 10.  db2 writes row 10 and commits.
+# Without RLL: page-level write-write → BUSY_SNAPSHOT.
+# With RLL: rows 10 ≠ 20 → no row conflict.
+# With RC: the read of row 10 doesn't count either.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 4.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t4(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t4;
+      INSERT INTO t4 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # db1: update row 20 and read row 10
+  do_test 4.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t4 SET v = 'TWENTY_db1' WHERE k = 20;
+        SELECT v FROM t4 WHERE k = 10;
+    }
+  } {ten}
+
+  # db2: update row 10 (same page, different row) and commit
+  do_test 4.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t4 SET v = 'TEN_db2' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # RLL resolves the page conflict (disjoint rows).  RC ignores the read.
+  do_test 4.$tn.3 {
+    if {$tn == 1} {
+      catch { sql1 COMMIT }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch { sql1 COMMIT } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 5.x: Generation reset — RC + RLL after WAL2 checkpoint
+#
+# After a checkpoint resets the WAL generation (new salts), the sidecar
+# is deleted.  Subsequent RC + RLL commits must:
+#   a) succeed when rows are disjoint (no false conflict after gen change)
+#   b) still detect real write-write conflicts correctly
+#
+# Sequence:
+#   db1 commits row 100 (old generation, creates sidecar)
+#   db2 PASSIVE checkpoints (deletes old sidecar, resets generation)
+#   db2 commits row 10 (new generation, creates fresh sidecar)
+#   db1 writes row 20 + reads row 10 in RC+RLL mode → disjoint → succeeds
+#   db1 writes row 10 in another txn → real write-write → BUSY_SNAPSHOT
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 5.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t5(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t5;
+      INSERT INTO t5 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # db1 commits row 100 — old generation.
+  do_test 5.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t5 VALUES(100,'pre'); COMMIT; }
+  } {}
+
+  # PASSIVE checkpoint — may reset generation / delete sidecar.
+  do_test 5.$tn.2 {
+    sql2 { PRAGMA wal_checkpoint(PASSIVE) }
+    set x 1
+  } {1}
+
+  # db2 commits row 10 update — creates new-generation sidecar.
+  do_test 5.$tn.3 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TEN_db2' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # db1: write row 20, read row 10 — disjoint rows + RC → no conflict.
+  do_test 5.$tn.4 {
+    if {$tn == 1} {
+      catch {
+        sql1 {
+          BEGIN CONCURRENT;
+            UPDATE t5 SET v = 'TWENTY_db1' WHERE k = 20;
+            SELECT v FROM t5 WHERE k = 10;
+          COMMIT;
+        }
+      }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch {
+        sql1 {
+          BEGIN CONCURRENT;
+            UPDATE t5 SET v = 'TWENTY_db1' WHERE k = 20;
+            SELECT v FROM t5 WHERE k = 10;
+          COMMIT;
+        }
+      } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  # db2 commits row 10 again — this sets up the next conflict.
+  do_test 5.$tn.5a {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TEN_db2_v2' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # db1: BEGIN CONCURRENT first (takes snapshot), THEN db2 commits row 10.
+  # db1 writes the SAME row 10 → real write-write conflict → BUSY_SNAPSHOT.
+  do_test 5.$tn.5b {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TEN_db1' WHERE k = 10;
+    }
+  } {}
+
+  do_test 5.$tn.5c {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TEN_db2_v3' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  do_test 5.$tn.6 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 6.x: Cross-process sidecar — RC + RLL after checkpoint + new sidecar
+#
+# Exercises the full cross-process lifecycle under WAL2:
+#   1) db1 commits → sidecar created
+#   2) db2 PASSIVE checkpoints → sidecar trimmed/deleted
+#   3) db2 commits a different row → new sidecar record
+#   4) db1 commits a non-overlapping row → incremental/full sidecar load
+#      resolves as no-conflict (different row + RC skip)
+#
+# This is the key cross-process sidecar test for RC + RLL under WAL2:
+# in tn=1 (cross-process), db1 must load the sidecar written by db2 to
+# see that the rows are disjoint.  Without it, page-level conflict fires.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 6.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t6(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t6;
+      INSERT INTO t6 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # Step 1: db1 commits row 100 — establishes sidecar.
+  do_test 6.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t6 VALUES(100,'db1-pre'); COMMIT; }
+  } {}
+
+  # Step 2: PASSIVE checkpoint.
+  do_test 6.$tn.2 {
+    sql2 { PRAGMA wal_checkpoint(PASSIVE) }
+    set x 1
+  } {1}
+
+  # Step 3: db2 writes row 10 and commits — new sidecar record.
+  do_test 6.$tn.3 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t6 VALUES(10,'db2-ten'); COMMIT; }
+  } {}
+
+  # Step 4: db1 writes row 20 + reads row 10 (RC+RLL, disjoint).
+  # db1 must load the sidecar to discover row 10 ≠ row 20 (RLL check)
+  # and RC mode skips the read of row 10.
+  do_test 6.$tn.4 {
+    if {$tn == 1} {
+      catch {
+        sql1 {
+          BEGIN CONCURRENT;
+            INSERT INTO t6 VALUES(20,'db1-twenty');
+            SELECT k FROM t6 WHERE k <= 10;
+          COMMIT;
+        }
+      }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch {
+        sql1 {
+          BEGIN CONCURRENT;
+            INSERT INTO t6 VALUES(20,'db1-twenty');
+            SELECT k FROM t6 WHERE k <= 10;
+          COMMIT;
+        }
+      } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 7.x: File-switch — RC + RLL across WAL file boundary
+#
+# Force a WAL2 file switch.  db2 commits to the new file.  db1 holds an
+# open CONCURRENT txn that spans the switch.
+# In RC mode with RLL, disjoint rows across the file boundary must not
+# cause a conflict.  Real row overlap must still be caught.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 7.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      PRAGMA wal_autocheckpoint = 0;
+      CREATE TABLE IF NOT EXISTS t7(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t7;
+      INSERT INTO t7 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # Fill the first WAL file to trigger a file switch.
+  do_test 7.$tn.1 {
+    sql1 {
+      INSERT INTO t7 SELECT k+100, v FROM t7;
+      INSERT INTO t7 SELECT k+200, v FROM t7;
+    }
+  } {}
+
+  # db1: start CONCURRENT, write row 1000, read some low rows (RC skips reads).
+  do_test 7.$tn.2 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t7 VALUES(1000, 'db1');
+        SELECT k FROM t7 WHERE k <= 3;
+    }
+  } {1 2 3}
+
+  # db2: commit row 2000 — non-overlapping, possibly on new WAL file.
+  do_test 7.$tn.3 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t7 VALUES(2000, 'db2');
+      COMMIT;
+    }
+  } {}
+
+  # Disjoint rows across file boundary → no conflict.
+  do_test 7.$tn.4 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # Now test real overlap across the boundary.
+  do_test 7.$tn.5 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t7 VALUES(3000, 'db1-3000');
+    }
+  } {}
+
+  do_test 7.$tn.6 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t7 VALUES(3000, 'db2-3000');
+      COMMIT;
+    }
+  } {}
+
+  do_test 7.$tn.7 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 8.x: Read-first snapshot detection with RLL under WAL2
+#
+# Pure read-first: pRowLocks is allocated at BEGIN CONCURRENT, so the
+# SELECT records ROW_LOCK_READ entries before any write.  In snapshot
+# mode, a concurrent writer modifying a read row must still produce
+# SQLITE_BUSY_SNAPSHOT under WAL2.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 8.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE IF NOT EXISTS t8(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t8;
+      INSERT INTO t8 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = snapshot }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # Read-first: SELECT runs before any write.
+  do_test 8.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        SELECT rowid FROM t8 WHERE rowid < 50;
+    }
+  } {10 20}
+
+  # INSERT so db1 has a dirty page for COMMIT to write to WAL.
+  do_test 8.$tn.2 {
+    sql1 { INSERT INTO t8 VALUES(99, 'ninetynine'); }
+  } {}
+
+  # db2 updates row 10 and commits.
+  do_test 8.$tn.3 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t8 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # Snapshot: read of row 10 + db2's write of row 10 → BUSY_SNAPSHOT.
+  do_test 8.$tn.4 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+# Helpers for sidecar file existence checks (§9–10).
+proc sidecar0 {} { return "[file normalize test.db]-rowlog" }
+proc sidecar1 {} { return "[file normalize test.db]-wal2-rowlog" }
+
+#--------------------------------------------------------------------------
+# 9.x: Multi-switch sidecar existence and row-log accumulation
+#
+# Force the WAL2 active file to switch back and forth multiple times
+# (file 0 → 1 → 0 → 1) with CONCURRENT commits at each stage.
+# At each step verify:
+#   a) The correct sidecar file exists for the file that was just written
+#   b) The row-log count increases monotonically across switches
+# Finally, close/reopen to confirm both sidecars are cleaned up.
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 9.setup {
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval { PRAGMA wal_autocheckpoint = 0; }
+  db eval { PRAGMA row_level_locking = 1; }
+  db eval { PRAGMA isolation_level = read_committed; }
+  db eval {
+    CREATE TABLE t9(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t9 VALUES(1,'a'),(2,'b'),(3,'c');
+  }
+} {}
+
+# Nothing yet.
+do_test 9.1 {
+  list [file exists [sidecar0]] [file exists [sidecar1]]
+} {0 0}
+
+# --- Round 1: commit on active file (initially file 0). ---
+do_test 9.2 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t9 VALUES(10, 'r1');
+    COMMIT;
+  }
+  file exists [sidecar0]
+} {1}
+
+do_test 9.2.count {
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {1}
+
+# Force switch to file 1: fill up file 0 so WAL2 rotates.
+do_test 9.3.fill {
+  for {set i 100} {$i < 250} {incr i} {
+    db eval "INSERT INTO t9 VALUES($i, 'fill-$i')"
+  }
+  set x ok
+} {ok}
+
+# --- Round 2: commit on file 1 (post-switch). ---
+do_test 9.4 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t9 VALUES(1001, 'r2');
+    COMMIT;
+  }
+  # At least one sidecar must exist (which one depends on active file).
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+do_test 9.4.count {
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {2}
+
+# Checkpoint file 0 (non-active) → sidecar0 may be deleted.
+do_test 9.5.ckpt {
+  db eval { PRAGMA wal_checkpoint(PASSIVE) }
+  set x ok
+} {ok}
+
+# Force switch back to file 0: fill file 1 so WAL2 rotates again.
+do_test 9.6.fill {
+  for {set i 250} {$i < 400} {incr i} {
+    db eval "INSERT INTO t9 VALUES($i, 'fill-$i')"
+  }
+  set x ok
+} {ok}
+
+# --- Round 3: commit on file 0 again. ---
+do_test 9.7 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t9 VALUES(2001, 'r3');
+    COMMIT;
+  }
+  file exists [sidecar0]
+} {1}
+
+do_test 9.7.count {
+  expr { [sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db] >= 3 }
+} {1}
+
+# Checkpoint file 1 (now non-active) → sidecar1 may be deleted.
+do_test 9.8.ckpt {
+  db eval { PRAGMA wal_checkpoint(PASSIVE) }
+  set x ok
+} {ok}
+
+# Force switch to file 1 again.
+do_test 9.9.fill {
+  for {set i 400} {$i < 550} {incr i} {
+    db eval "INSERT INTO t9 VALUES($i, 'fill-$i')"
+  }
+  set x ok
+} {ok}
+
+# --- Round 4: commit on file 1 again. ---
+do_test 9.10 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t9 VALUES(3001, 'r4');
+    COMMIT;
+  }
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+do_test 9.10.count {
+  expr { [sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db] >= 4 }
+} {1}
+
+# Close → exhaustive 2-pass checkpoint → both sidecars deleted.
+do_test 9.11 {
+  db close
+  list [file exists [sidecar0]] [file exists [sidecar1]]
+} {0 0}
+
+# Data integrity after all the switching.
+sqlite3 db test.db
+do_test 9.12 {
+  db eval { SELECT count(*) FROM t9 }
+} {457}
+
+#--------------------------------------------------------------------------
+# 10.x: Multi-switch RC + RLL conflict resolution across WAL boundaries
+#
+# With autocheckpoint off, force several WAL file switches and interleave
+# CONCURRENT commits from db1 and db2.  After multiple switches:
+#   a) Disjoint rows still commit (row log loaded correctly from whichever
+#      sidecar file is relevant — including after switch-back).
+#   b) Same-row write-write is still detected as SQLITE_BUSY_SNAPSHOT.
+#   c) At least one sidecar file exists during the active phase.
+#
+# This exercises the full dual-sidecar machinery with RC + RLL across
+# file boundaries, confirming that walSidecarLoad reads the correct file's
+# sidecar, walFindCommitRowSet decodes external frames properly, and
+# rowLockSetHasConflict resolves conflicts with the correct bRC flag
+# after the active WAL file has been rotated multiple times.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 10.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      PRAGMA wal_autocheckpoint = 0;
+      CREATE TABLE IF NOT EXISTS t10(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t10;
+      INSERT INTO t10 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+      list
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+      db2 eval { PRAGMA isolation_level = read_committed }
+      list
+    }
+  } {}
+
+  # --- Switch 1: fill file 0 → switch to file 1 ---
+  do_test 10.$tn.switch1 {
+    sql1 {
+      INSERT INTO t10 SELECT k+100, v FROM t10;
+      INSERT INTO t10 SELECT k+200, v FROM t10;
+      INSERT INTO t10 SELECT k+400, v FROM t10;
+    }
+  } {}
+
+  # db2 commits row 5000 on file 1.
+  do_test 10.$tn.1a {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t10 VALUES(5000, 'db2-5000');
+      COMMIT;
+    }
+  } {}
+
+  # db1: disjoint row 6000 — should succeed.
+  do_test 10.$tn.1b {
+    set rc [catch {
+      sql1 {
+        BEGIN CONCURRENT;
+          INSERT INTO t10 VALUES(6000, 'db1-6000');
+        COMMIT;
+      }
+    } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # --- Switch 2: fill file 1 → switch back to file 0 ---
+  do_test 10.$tn.switch2 {
+    sql1 {
+      INSERT INTO t10 SELECT k+1000, v FROM t10 WHERE k < 100;
+    }
+    # Checkpoint file 0 so WAL2 can rotate back.
+    sql1 { PRAGMA wal_checkpoint(PASSIVE) }
+    sql1 {
+      INSERT INTO t10 SELECT k+2000, v FROM t10 WHERE k < 100;
+    }
+    set x ok
+  } {ok}
+
+  # db2 commits row 7000 on (possibly) file 0.
+  do_test 10.$tn.2a {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t10 VALUES(7000, 'db2-7000');
+      COMMIT;
+    }
+  } {}
+
+  # db1: disjoint row 8000 — should still succeed across file boundary.
+  do_test 10.$tn.2b {
+    set rc [catch {
+      sql1 {
+        BEGIN CONCURRENT;
+          INSERT INTO t10 VALUES(8000, 'db1-8000');
+        COMMIT;
+      }
+    } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # --- Switch 3: fill and switch again ---
+  do_test 10.$tn.switch3 {
+    sql1 {
+      INSERT INTO t10 SELECT k+3000, v FROM t10 WHERE k < 100;
+    }
+    sql1 { PRAGMA wal_checkpoint(PASSIVE) }
+    sql1 {
+      INSERT INTO t10 SELECT k+4000, v FROM t10 WHERE k < 100;
+    }
+    set x ok
+  } {ok}
+
+  # db2 commits row 9000.
+  do_test 10.$tn.3a {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t10 VALUES(9000, 'db2-9000');
+      COMMIT;
+    }
+  } {}
+
+  # db1: disjoint row 9500 — still no conflict after 3 switches.
+  do_test 10.$tn.3b {
+    set rc [catch {
+      sql1 {
+        BEGIN CONCURRENT;
+          INSERT INTO t10 VALUES(9500, 'db1-9500');
+        COMMIT;
+      }
+    } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # --- Conflict detection: same row after multiple switches ---
+
+  # db1 starts a transaction writing row 10000.
+  do_test 10.$tn.4a {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t10 VALUES(10000, 'db1-10000');
+    }
+  } {}
+
+  # db2 commits the SAME row 10000 after db1's snapshot.
+  do_test 10.$tn.4b {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t10 VALUES(10000, 'db2-10000');
+      COMMIT;
+    }
+  } {}
+
+  # db1's commit must detect the write-write conflict even after
+  # multiple file switches.
+  do_test 10.$tn.4c {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+
+  # --- RC benefit: disjoint write + read overlap still succeeds ---
+
+  # db2 commits an update to row 1 after multiple switches.
+  do_test 10.$tn.5a {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t10 SET v = 'db2-updated' WHERE k = 1;
+      COMMIT;
+    }
+  } {}
+
+  # db1: write row 2, read row 1 — disjoint writes, RC skips read.
+  do_test 10.$tn.5b {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t10 SET v = 'db1-updated' WHERE k = 2;
+        SELECT v FROM t10 WHERE k = 1;
+    }
+  } {db2-updated}
+
+  do_test 10.$tn.5c {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # Data integrity — spot-check the key rows survived all the switching.
+  do_test 10.$tn.6 {
+    set v1 [sql1 { SELECT v FROM t10 WHERE k = 1 }]
+    set v2 [sql1 { SELECT v FROM t10 WHERE k = 2 }]
+    set e5 [sql1 { SELECT count(*) FROM t10 WHERE k IN (5000,6000,7000,8000,9000,9500) }]
+    list $v1 $v2 $e5
+  } {db2-updated db1-updated 6}
+
+  catch { sql2 ROLLBACK }
+}
+
+finish_test

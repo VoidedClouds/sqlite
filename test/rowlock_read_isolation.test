@@ -1,0 +1,34 @@
+# 2026 March 27
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Driver: sources all rowlock_read_isolation_*.test sub-files.
+#
+# Tests for row-level locking COMBINED with read isolation
+# (SQLITE_ENABLE_ROW_LEVEL_LOCKING + SQLITE_ENABLE_READ_ISOLATION).
+#
+# Sub-files:
+#   rowlock_read_isolation_wal.test   - sections 1-5   RC/snapshot + RLL under WAL1
+#   rowlock_read_isolation_wal2.test  - sections 1-8   RC/snapshot + RLL under WAL2
+
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Set ::SLAVE so that finish_test inside each sub-file calls finish_test_precleanup
+# (resetting per-file state) but does NOT call finalize_testing / exit.
+set ::SLAVE 1
+
+source $testdir/rowlock_read_isolation_wal.test
+reset_db
+source $testdir/rowlock_read_isolation_wal2.test
+
+# All sub-files done. Produce the combined summary.
+unset ::SLAVE
+finish_test

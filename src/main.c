@@ -2940,6 +2940,7 @@ static const int aHardLimit[] = {
   SQLITE_MAX_TRIGGER_DEPTH,
   SQLITE_MAX_WORKER_THREADS,
   SQLITE_MAX_PARSER_DEPTH,
+  SQLITE_MAX_ROW_LOCK_ENTRIES,
 };
 
 /*
@@ -3022,7 +3023,8 @@ int sqlite3_limit(sqlite3 *db, int limitId, int newLimit){
   assert( aHardLimit[SQLITE_LIMIT_VARIABLE_NUMBER]==SQLITE_MAX_VARIABLE_NUMBER);
   assert( aHardLimit[SQLITE_LIMIT_TRIGGER_DEPTH]==SQLITE_MAX_TRIGGER_DEPTH );
   assert( aHardLimit[SQLITE_LIMIT_WORKER_THREADS]==SQLITE_MAX_WORKER_THREADS );
-  assert( SQLITE_LIMIT_PARSER_DEPTH==(SQLITE_N_LIMIT-1) );
+  assert( aHardLimit[SQLITE_LIMIT_ROW_LOCK_ENTRIES]==SQLITE_MAX_ROW_LOCK_ENTRIES);
+  assert( SQLITE_LIMIT_ROW_LOCK_ENTRIES==(SQLITE_N_LIMIT-1) );
 
 
   if( limitId<0 || limitId>=SQLITE_N_LIMIT ){
@@ -4763,6 +4765,27 @@ int sqlite3_test_control(int op, ...){
         *pOnOff = sqlite3Config.bJsonSelfcheck;
       }else{
         sqlite3Config.bJsonSelfcheck = (u8)((*pOnOff)&0xff);
+      }
+#endif
+      break;
+    }
+
+    /*
+    **   sqlite3_test_control(SQLITE_TESTCTRL_WAL_ROWLOG_COUNT, db, &N)
+    **
+    ** Write into *N the number of WalCommitRowSet entries currently held
+    ** in the WAL row log for the main database of connection db.
+    ** Useful for unit testing that row-level lock entries are recorded and
+    ** trimmed correctly.
+    */
+    case SQLITE_TESTCTRL_WAL_ROWLOG_COUNT: {
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+      sqlite3 *db2 = va_arg(ap, sqlite3*);
+      int *pN = va_arg(ap, int*);
+      if( db2 && pN && db2->nDb>0 && db2->aDb[0].pBt ){
+        *pN = sqlite3BtreeRowLogCount(db2->aDb[0].pBt);
+      }else if( pN ){
+        *pN = 0;
       }
 #endif
       break;

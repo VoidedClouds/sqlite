@@ -787,6 +787,47 @@ struct WalCkptInfo {
 **   if it is set to 2, then the WRITER lock is held but must be released
 **   by walHandleException() if a SEH exception is thrown.
 */
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Per-commit row write set stored in the shared WalRowLog (Option A:
+** in-memory sidecar).  Each committed CONCURRENT transaction appends one
+** of these nodes to WalRowLog.pCommits.  At conflict-check time the list
+** is scanned to see whether a page-level hit is a genuine row-level conflict.
+**
+** iMinFrame / iMaxFrame delimit the WAL frames written in that commit.
+** The set is trimmed when nBackfill advances past iMaxFrame.
+*/
+struct WalCommitRowSet {
+  u32                    iMinFrame;  /* First WAL frame of the commit */
+  u32                    iMaxFrame;  /* Last WAL frame of the commit */
+  struct RowLockSet     *pRows;      /* Rows written (owned by this node) */
+  struct WalCommitRowSet *pNext;     /* Linked list, newest first */
+};
+
+/*
+** WalRowLog is a per-WAL-file singleton that holds the shared list of
+** WalCommitRowSet entries.  All Wal* connections in the same process that
+** open the same WAL file share one WalRowLog (identified by the apWiData[0]
+** pointer, which the OS VFS maps to the same address for every opener within
+** a process).  Access to pCommits is protected by the WAL write lock (which
+** only one connection can hold at a time).  The global list gpWalRowLog is
+** protected by SQLITE_MUTEX_STATIC_APP1.
+*/
+struct WalRowLog {
+  void                   *pKey;     /* apWiData[0] — unique per WAL file */
+  int                     nRef;     /* Number of Wal* objects sharing this */
+  struct WalCommitRowSet *apCommits[2]; /* Per-file committed row sets */
+  struct WalRowLog       *pNext;    /* Next in gpWalRowLog list */
+  int                     abSidecarLoaded[2]; /* 1 once sidecar has been loaded */
+  i64                     aiSidecarReadOff[2]; /* Sidecar file read watermark */
+};
+
+/* Global list of all live WalRowLog objects, protected by SQLITE_MUTEX_STATIC_APP1. */
+static struct WalRowLog *gpWalRowLog = 0;
+
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING */
+
 struct Wal {
   sqlite3_vfs *pVfs;         /* The VFS used to create pDbFd */
   sqlite3_file *pDbFd;       /* File handle for the database file */
@@ -835,7 +876,567 @@ struct Wal {
 #ifdef SQLITE_ENABLE_SETLK_TIMEOUT
   sqlite3 *db;
 #endif
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+  int bReadCommitted;         /* Non-zero for read-committed isolation mode */
+#endif
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  /* Row-level locking support (Option A: in-memory only, per-process) */
+  struct WalRowLog        *pRowLog;     /* Shared per-file commit row log */
+  struct RowLockSet       *pCurReadRows; /* Current txn read rows (set before conflict check) */
+  struct WalMergePage     *pMergePages;  /* Pages needing 3-way merge at next commit */
+  /* Option C: durable sidecar row-log for cross-process row-level locking */
+  sqlite3_file *apSidecarFd[2]; /* Open fds for sidecar files; ptrs into Wal alloc */
+  char         *azSidecar[2];   /* Malloc'd paths to sidecar files; NULL=disabled */
+  int           abSidecarOk[2]; /* 1=sidecar file is open and writable */
+  i64           aiSidecarOff[2];/* Next write offset within sidecar files */
+#endif
 };
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+
+/* ============================================================
+** Option C sidecar row-log helpers
+** All errors are silent: on any I/O failure the sidecar is
+** deleted/disabled and the system falls back to page-level locks.
+** ============================================================ */
+
+/*
+** Derive the sidecar path from the WAL path: replace the trailing
+** "-wal" suffix with "-rowlog", or append "-rowlog" if no such suffix.
+** Returns a sqlite3_malloc'd string; caller must sqlite3_free().
+*/
+static char *walSidecarPath(const char *zWal, int iWal){
+  int n = sqlite3Strlen30(zWal);
+  if( n>4 && memcmp(zWal+n-4, "-wal", 4)==0 ){
+    if( iWal==0 ){
+      return sqlite3_mprintf("%.*s-rowlog", n-4, zWal);
+    }else{
+      return sqlite3_mprintf("%.*s-wal2-rowlog", n-4, zWal);
+    }
+  }
+  if( iWal==0 ){
+    return sqlite3_mprintf("%s-rowlog", zWal);
+  }else{
+    return sqlite3_mprintf("%s-wal2-rowlog", zWal);
+  }
+}
+
+/*
+** Store the sidecar path derived from the WAL path.
+** Cross-process load and salt validation happen lazily in walSidecarLoad
+** when the first CONCURRENT commit occurs.
+** Called once from sqlite3WalOpen().
+*/
+static void walSidecarOpen(Wal *pWal){
+  pWal->azSidecar[0] = walSidecarPath(pWal->zWalName, 0);
+  pWal->azSidecar[1] = walSidecarPath(pWal->zWalName, 1);
+  /* abSidecarOk stays 0; fds opened lazily by walSidecarLoad/walSidecarAppend. */
+}
+
+/*
+** Close and delete the sidecar file, freeing all associated state.
+** Idempotent: safe to call even if the sidecar was never opened.
+*/
+/*
+** Reset a WalRowLog to the "no sidecar loaded" state, discarding all
+** in-memory commit records.  Called both from walSidecarDelete (when
+** the sidecar file is physically removed) and from walSidecarLoad's
+** incremental path when a generation change is detected mid-session
+** (e.g. another process ran a TRUNCATE checkpoint and the sidecar file
+** no longer exists or has shrunk below the watermark).
+*/
+static void walRowLogReset(struct WalRowLog *pLog, int iWal){
+  struct WalCommitRowSet *pCRS;
+  if( pLog==0 ) return;
+  pLog->abSidecarLoaded[iWal] = 0;
+  pLog->aiSidecarReadOff[iWal] = 0;
+  pCRS = pLog->apCommits[iWal];
+  pLog->apCommits[iWal] = 0;
+  while( pCRS ){
+    struct WalCommitRowSet *pNext = pCRS->pNext;
+    rowLockSetFree(pCRS->pRows);
+    sqlite3_free(pCRS);
+    pCRS = pNext;
+  }
+}
+
+static void walRowLogResetAll(struct WalRowLog *pLog){
+  walRowLogReset(pLog, 0);
+  walRowLogReset(pLog, 1);
+}
+
+static void walSidecarDelete(Wal *pWal, int iWal){
+  if( pWal->abSidecarOk[iWal] ){
+    sqlite3OsClose(pWal->apSidecarFd[iWal]);
+    pWal->abSidecarOk[iWal] = 0;
+    pWal->aiSidecarOff[iWal] = 0;
+  }
+  if( pWal->azSidecar[iWal] ){
+    sqlite3BeginBenignMalloc();
+    sqlite3OsDelete(pWal->pVfs, pWal->azSidecar[iWal], 0);
+    sqlite3EndBenignMalloc();
+    /* Do NOT free azSidecar[iWal] — the path is still valid for the next WAL
+    ** generation; walSidecarAppend will create a fresh file then. */
+  }
+  /* Reset the WalRowLog so walSidecarLoad() will re-populate apCommits[iWal]
+  ** from the new generation's sidecar on the next commit attempt. */
+  walRowLogReset(pWal->pRowLog, iWal);
+}
+
+/*
+** Permanently disable the sidecar after an I/O error during append.
+** Closes the fd, deletes the file, and clears the path so no further
+** appends are attempted for the lifetime of this Wal object.
+*/
+static void walSidecarFail(Wal *pWal, int iWal){
+  if( pWal->abSidecarOk[iWal] ){
+    sqlite3OsClose(pWal->apSidecarFd[iWal]);
+    pWal->abSidecarOk[iWal] = 0;
+    pWal->aiSidecarOff[iWal] = 0;
+  }
+  if( pWal->azSidecar[iWal] ){
+    sqlite3BeginBenignMalloc();
+    sqlite3OsDelete(pWal->pVfs, pWal->azSidecar[iWal], 0);
+    sqlite3EndBenignMalloc();
+    sqlite3_free(pWal->azSidecar[iWal]);
+    pWal->azSidecar[iWal] = 0;  /* NULL disables all future appends */
+  }
+}
+
+/*
+** Append one commit record (for the row set pRows spanning WAL frames
+** [iMinFrame,iMaxFrame]) to the sidecar file.  If the sidecar file is
+** not yet open it is created here and a 16-byte header is written first.
+**
+** Record layout written to disk:
+**   u32  mxFrame      last frame of this commit
+**   u32  iMinFrame    first frame of this commit (needed for range lookup)
+**   <body from rowLockSetSerialize: u32 nEntry, u8 bSpilled, u8[3], entries>
+**   u32  checksum     additive over all preceding bytes of this record
+**
+** Any I/O error permanently disables the sidecar via walSidecarFail().
+*/
+static void walSidecarAppend(
+  Wal *pWal,
+  int iWal,
+  struct RowLockSet *pRows,
+  u32 iMinFrame,
+  u32 iMaxFrame
+){
+  int rc;
+  u8 *aBody = 0;
+  u8 *aRecord = 0;
+  u32 nBody, nRecord;
+  u32 checksum;
+  int i;
+
+  if( pWal->azSidecar[iWal]==0 || pRows==0 ) return;
+
+  /* -------------------------------------------------------
+  ** Lazily open/create the sidecar file and write its header.
+  ** ------------------------------------------------------- */
+  if( !pWal->abSidecarOk[iWal] ){
+    int flags = SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
+    int oflags = flags;
+    u8 aHdr[16];
+    rc = sqlite3OsOpen(pWal->pVfs, pWal->azSidecar[iWal],
+                       pWal->apSidecarFd[iWal], flags, &oflags);
+    if( rc!=SQLITE_OK ) goto sidecar_fail;
+    /* 16-byte file header */
+    sqlite3Put4byte(aHdr,    0x524C4F47u);   /* "RLOG" magic */
+    sqlite3Put4byte(aHdr+4,  1u);            /* version 1   */
+    sqlite3Put4byte(aHdr+8,  pWal->hdr.aSalt[0]);
+    sqlite3Put4byte(aHdr+12, pWal->hdr.aSalt[1]);
+    rc = sqlite3OsWrite(pWal->apSidecarFd[iWal], aHdr, 16, 0);
+    if( rc!=SQLITE_OK ) goto sidecar_fail;
+    rc = sqlite3OsSync(pWal->apSidecarFd[iWal], SQLITE_SYNC_NORMAL);
+    if( rc!=SQLITE_OK ) goto sidecar_fail;
+    pWal->aiSidecarOff[iWal] = 16;
+    pWal->abSidecarOk[iWal] = 1;
+  }
+
+  /* -------------------------------------------------------
+  ** Serialize entries via btree.c helper (avoids incomplete-type
+  ** issues with struct RowLockEntry in the amalgamation).
+  ** aBody layout: u32 nEntry, u8 bSpilled, u8[3], entries...
+  ** nBody is the byte count of aBody.
+  ** ------------------------------------------------------- */
+  aBody = rowLockSetSerialize(pRows, &nBody);
+  if( aBody==0 ) goto sidecar_fail;
+
+  /* -------------------------------------------------------
+  ** Build full record: [u32 mxFrame][u32 iMinFrame][aBody][u32 checksum]
+  ** ------------------------------------------------------- */
+  nRecord = 4 + 4 + nBody + 4;
+  aRecord = (u8*)sqlite3_malloc64(nRecord);
+  if( aRecord==0 ) goto sidecar_fail;
+  sqlite3Put4byte(aRecord+0, iMaxFrame);
+  sqlite3Put4byte(aRecord+4, iMinFrame);
+  memcpy(aRecord+8, aBody, nBody);
+  sqlite3_free(aBody); aBody = 0;
+
+  checksum = 0;
+  for(i=0; i<(int)(nRecord-4); i++) checksum += aRecord[i];
+  sqlite3Put4byte(aRecord+nRecord-4, checksum);
+
+  /* -------------------------------------------------------
+  ** Write + fdatasync.
+  ** ------------------------------------------------------- */
+  rc = sqlite3OsWrite(pWal->apSidecarFd[iWal], aRecord, (int)nRecord,
+                      pWal->aiSidecarOff[iWal]);
+  sqlite3_free(aRecord); aRecord = 0;
+  if( rc!=SQLITE_OK ) goto sidecar_fail;
+  rc = sqlite3OsSync(pWal->apSidecarFd[iWal], SQLITE_SYNC_NORMAL);
+  if( rc!=SQLITE_OK ) goto sidecar_fail;
+  pWal->aiSidecarOff[iWal] += (i64)nRecord;
+  return;
+
+sidecar_fail:
+  sqlite3_free(aBody);
+  sqlite3_free(aRecord);
+  walSidecarFail(pWal, iWal);
+}
+
+/* ============================================================
+** End of Option C sidecar helpers
+** ============================================================ */
+
+/* Forward declaration needed by walSidecarLoad (defined below walAcquireRowLog) */
+static struct WalRowLog *walGetRowLog(Wal*);
+
+/*
+** walSidecarParseBlock -- shared record-parsing core used by both the
+** full initial load and the incremental load paths.
+**
+** Parses a contiguous buffer of sidecar record bytes aBuf[0..nBuf-1] and
+** prepends valid commit records to pLog->apCommits[iWal].  Only records with
+** mxFrame > 0 and mxFrame <= mxFrameLimit are added (pass mxFrameLimit==0
+** to accept any positive mxFrame).
+**
+** Returns the number of bytes successfully consumed.  Stops without error
+** at the first partial, unknown-type, or corrupt-checksum record.
+*/
+static int walSidecarParseBlock(
+  struct WalRowLog *pLog,
+  int iWal,
+  const u8 *aBuf,
+  int nBuf,
+  u32 mxFrameLimit
+){
+  int off = 0;
+  while( off < nBuf ){
+    int offStart = off;
+    u32 mxFrame, iMinFrame, nEntry;
+    int bodyOff, entryOff, i;
+    u32 expected, stored;
+    struct RowLockSet *pRows;
+    struct WalCommitRowSet *pCRS;
+
+    if( off+16 > nBuf ) break;
+    mxFrame   = sqlite3Get4byte(aBuf+off);
+    iMinFrame = sqlite3Get4byte(aBuf+off+4);
+    /* Record layout: [mxFrame(4)][iMinFrame(4)][body][cksum(4)]
+    ** body = [nEntry(4)][bSpilled(1)][reserved(3)][entries] */
+    bodyOff  = off + 8;
+    nEntry   = sqlite3Get4byte(aBuf+bodyOff);
+    entryOff = bodyOff + 8;
+
+    for(i=0; i<(int)nEntry; i++){
+      u8 flags;
+      if( entryOff+2 > nBuf ) goto parse_done;
+      flags = aBuf[entryOff+1];
+      if( flags==0x01 ){
+        entryOff += 16;
+      }else if( flags==0x02 ){
+        u32 nKey;
+        if( entryOff+12 > nBuf ) goto parse_done;
+        nKey = sqlite3Get4byte(aBuf+entryOff+8);
+        if( (i64)entryOff+12+(i64)nKey > (i64)nBuf ) goto parse_done;
+        entryOff += 12 + (int)nKey;
+      }else{
+        goto parse_done;  /* unknown entry type */
+      }
+    }
+
+    if( entryOff+4 > nBuf ) break;
+    expected = 0;
+    for(i=offStart; i<entryOff; i++) expected += aBuf[i];
+    stored = sqlite3Get4byte(aBuf+entryOff);
+    if( expected!=stored ) break;  /* bad checksum; stop here */
+
+    if( mxFrame>0 && (mxFrameLimit==0 || mxFrame<=mxFrameLimit) ){
+      int nBody = entryOff - bodyOff;
+      pRows = rowLockSetDeserialize(aBuf+bodyOff, nBody);
+      if( pRows ){
+        pCRS = (struct WalCommitRowSet *)
+                   sqlite3MallocZero(sizeof(struct WalCommitRowSet));
+        if( pCRS ){
+          pCRS->iMinFrame = iMinFrame;
+          pCRS->iMaxFrame = mxFrame;
+          pCRS->pRows     = pRows;
+          pCRS->pNext     = pLog->apCommits[iWal];
+          pLog->apCommits[iWal]  = pCRS;
+        }else{
+          rowLockSetFree(pRows);
+        }
+      }
+    }
+
+    off = entryOff + 4;
+  }
+parse_done:
+  return off;
+}
+
+/*
+** walSidecarLoad -- called from walLockForCommit on every commit attempt
+** (under the WAL write lock).
+**
+** FULL LOAD (first call per WalRowLog lifetime, i.e. per WAL generation
+** per process): opens the sidecar file, validates the 16-byte header
+** against the WAL file's salts, deserializes every record into
+** pLog->apCommits[iWal], keeps the fd open for future appends, and records
+** pLog->aiSidecarReadOff[iWal].
+** On any header/checksum mismatch the file is deleted and page-level locks
+** are used as fallback.
+**
+** INCREMENTAL LOAD (all subsequent calls): reads only the bytes appended to
+** the sidecar since the last load (from pLog->aiSidecarReadOff[iWal] onward)
+** and adds any new commit records to pLog->apCommits[iWal].  This ensures
+** that records written by other processes between two of this process's own
+** commits are picked up, maintaining row-level precision across all
+** concurrent writers for the lifetime of the process.
+**
+** The incremental path opens the fd lazily on the committing connection if
+** it has not yet committed itself (fast-forwarding its append pointer to
+** aiSidecarReadOff[iWal] so that its first own append lands at the correct
+** offset).
+**
+** For WAL2, salt validation for the non-active WAL file reads the salt
+** from the WAL file header on disk (offset 16, 8 bytes), since
+** pHead->aSalt only reflects the currently active file.
+*/
+static void walSidecarLoad(Wal *pWal, const WalIndexHdr *pHead, int iWal){
+  struct WalRowLog *pLog;
+  u8 *aBuf = 0;
+  i64 nFile = 0;
+  int rc;
+  u32 aSalt[2];       /* Expected salt values for this WAL file */
+  u32 mxFrameLimit;   /* Max frame number for this WAL file */
+
+  if( pWal->azSidecar[iWal]==0 ) return;
+  pLog = walGetRowLog(pWal);
+  if( pLog==0 ) return;
+
+  /* Determine the salt and mxFrame for this specific WAL file.
+  ** In WAL2 mode, pHead->aSalt reflects only the active file. For the
+  ** non-active file, read the salt from its WAL file header on disk. */
+  if( isWalMode2(pWal) ){
+    int iActive = walidxGetFile(pHead);
+    mxFrameLimit = walidxGetMxFrame(pHead, iWal);
+    if( iWal==iActive ){
+      aSalt[0] = pHead->aSalt[0];
+      aSalt[1] = pHead->aSalt[1];
+    }else{
+      /* Read salt from the non-active WAL file header (offset 16, 8 bytes) */
+      u8 aSaltBuf[8];
+      rc = sqlite3OsRead(pWal->apWalFd[iWal], aSaltBuf, 8, 16);
+      if( rc!=SQLITE_OK ) return;  /* Cannot read; skip this sidecar */
+      aSalt[0] = sqlite3Get4byte(aSaltBuf);
+      aSalt[1] = sqlite3Get4byte(aSaltBuf+4);
+    }
+  }else{
+    aSalt[0] = pHead->aSalt[0];
+    aSalt[1] = pHead->aSalt[1];
+    mxFrameLimit = pHead->mxFrame;
+  }
+
+  /* ================================================================
+  ** INCREMENTAL PATH — sidecar already validated for this generation.
+  ** Read any records appended by other processes since the last call.
+  **
+  ** Generation-change detection: if another process ran a TRUNCATE
+  ** checkpoint the sidecar file was unlinked (open fails) or the file
+  ** was shrunk below our watermark.  In either case reset pLog and
+  ** return — the abSidecarLoaded[iWal]=0 state causes the full-load
+  ** path to run on the very next commit, picking up the new generation's
+  ** sidecar.
+  ** ================================================================ */
+  if( pLog->abSidecarLoaded[iWal] ){
+    i64 nNew;
+    if( pLog->aiSidecarReadOff[iWal]==0 ) return;
+
+    /* Open fd on this connection if it hasn't committed yet. */
+    if( !pWal->abSidecarOk[iWal] ){
+      int flags = SQLITE_OPEN_READWRITE, oflags = flags;
+      rc = sqlite3OsOpen(pWal->pVfs, pWal->azSidecar[iWal],
+                         pWal->apSidecarFd[iWal], flags, &oflags);
+      if( rc!=SQLITE_OK ){
+        walRowLogReset(pLog, iWal);
+        return;
+      }
+      pWal->aiSidecarOff[iWal] = pLog->aiSidecarReadOff[iWal];
+      pWal->abSidecarOk[iWal]  = 1;
+    }
+
+    rc = sqlite3OsFileSize(pWal->apSidecarFd[iWal], &nFile);
+    if( rc!=SQLITE_OK ) return;
+
+    if( nFile < pLog->aiSidecarReadOff[iWal] ){
+      sqlite3OsClose(pWal->apSidecarFd[iWal]);
+      pWal->abSidecarOk[iWal]  = 0;
+      pWal->aiSidecarOff[iWal] = 0;
+      walRowLogReset(pLog, iWal);
+      return;
+    }
+
+    nNew = nFile - pLog->aiSidecarReadOff[iWal];
+    if( nNew<=0 || nNew>(i64)0x4000000 ) return;
+    aBuf = (u8*)sqlite3_malloc64(nNew);
+    if( aBuf==0 ) return;
+    rc = sqlite3OsRead(pWal->apSidecarFd[iWal], aBuf, (int)nNew,
+                       pLog->aiSidecarReadOff[iWal]);
+    if( rc==SQLITE_OK ){
+      int nParsed = walSidecarParseBlock(pLog, iWal, aBuf, (int)nNew,
+                                         mxFrameLimit);
+      pLog->aiSidecarReadOff[iWal] += nParsed;
+    }
+    sqlite3_free(aBuf);
+    return;
+  }
+
+  /* ================================================================
+  ** FULL LOAD PATH — first commit attempt this WAL generation, OR
+  ** a generation change was detected in the incremental path above.
+  ** ================================================================ */
+  pLog->abSidecarLoaded[iWal] = 1;
+
+  if( pWal->abSidecarOk[iWal] ){
+    sqlite3OsClose(pWal->apSidecarFd[iWal]);
+    pWal->abSidecarOk[iWal]  = 0;
+    pWal->aiSidecarOff[iWal] = 0;
+  }
+
+  {
+    int flags = SQLITE_OPEN_READWRITE, oflags = flags;
+    rc = sqlite3OsOpen(pWal->pVfs, pWal->azSidecar[iWal],
+                       pWal->apSidecarFd[iWal], flags, &oflags);
+    if( rc!=SQLITE_OK ){
+      return;
+    }
+  }
+
+  rc = sqlite3OsFileSize(pWal->apSidecarFd[iWal], &nFile);
+  if( rc!=SQLITE_OK || nFile<16 || nFile>(i64)0x4000000 ) goto load_fail;
+  aBuf = (u8*)sqlite3_malloc64(nFile);
+  if( aBuf==0 ) goto load_fail;
+  rc = sqlite3OsRead(pWal->apSidecarFd[iWal], aBuf, (int)nFile, 0);
+  if( rc!=SQLITE_OK ) goto load_fail;
+
+  /* Validate 16-byte file header: magic, version, WAL generation salts. */
+  if( sqlite3Get4byte(aBuf+0) != 0x524C4F47u ) goto load_fail;
+  if( sqlite3Get4byte(aBuf+4) != 1u )          goto load_fail;
+  if( sqlite3Get4byte(aBuf+8)  != aSalt[0] )   goto load_fail;
+  if( sqlite3Get4byte(aBuf+12) != aSalt[1] )   goto load_fail;
+
+  /* Parse all records; treat any early stop as corruption. */
+  {
+    int nParsed = walSidecarParseBlock(
+                      pLog, iWal, aBuf+16, (int)(nFile-16), mxFrameLimit);
+    if( nParsed < (int)(nFile-16) ) goto load_fail;
+  }
+
+  /* File is valid — keep fd open for appending. */
+  sqlite3_free(aBuf);
+  pLog->aiSidecarReadOff[iWal] = nFile;
+  pWal->aiSidecarOff[iWal]     = nFile;
+  pWal->abSidecarOk[iWal]      = 1;
+  return;
+
+load_fail:
+  sqlite3_free(aBuf);
+  sqlite3OsClose(pWal->apSidecarFd[iWal]);
+  pWal->abSidecarOk[iWal]  = 0;
+  pWal->aiSidecarOff[iWal] = 0;
+  if( pWal->azSidecar[iWal] ){
+    sqlite3BeginBenignMalloc();
+    sqlite3OsDelete(pWal->pVfs, pWal->azSidecar[iWal], 0);
+    sqlite3EndBenignMalloc();
+  }
+}
+
+/*
+** Find or create the WalRowLog for pWal.  Returns with nRef incremented.
+** apWiData[0] must be non-NULL when called.
+*/
+static struct WalRowLog *walAcquireRowLog(Wal *pWal){
+  void *pKey = (void *)pWal->apWiData[0];
+  struct WalRowLog *p;
+  sqlite3_mutex *pMtx = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP1);
+  sqlite3_mutex_enter(pMtx);
+  for(p=gpWalRowLog; p; p=p->pNext){
+    if( p->pKey==pKey ){ p->nRef++; goto done; }
+  }
+  p = (struct WalRowLog *)sqlite3MallocZero(sizeof(*p));
+  if( p ){
+    p->pKey = pKey;
+    p->nRef = 1;
+    p->pNext = gpWalRowLog;
+    gpWalRowLog = p;
+  }
+done:
+  sqlite3_mutex_leave(pMtx);
+  return p;
+}
+
+/*
+** Decrement the reference count on pLog.  When it reaches zero, remove the
+** entry from gpWalRowLog and free all associated WalCommitRowSet objects.
+*/
+static void walReleaseRowLog(struct WalRowLog *pLog){
+  sqlite3_mutex *pMtx;
+  struct WalRowLog **pp;
+  struct WalCommitRowSet *pCRS;
+  if( pLog==0 ) return;
+  pMtx = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_APP1);
+  sqlite3_mutex_enter(pMtx);
+  if( --pLog->nRef > 0 ){
+    sqlite3_mutex_leave(pMtx);
+    return;
+  }
+  for(pp=&gpWalRowLog; *pp; pp=&(*pp)->pNext){
+    if( *pp==pLog ){ *pp = pLog->pNext; break; }
+  }
+  sqlite3_mutex_leave(pMtx);
+  {
+    int i;
+    for(i=0; i<2; i++){
+      pCRS = pLog->apCommits[i];
+      pLog->apCommits[i] = 0;
+      while( pCRS ){
+        struct WalCommitRowSet *pNext = pCRS->pNext;
+        rowLockSetFree(pCRS->pRows);
+        sqlite3_free(pCRS);
+        pCRS = pNext;
+      }
+    }
+  }
+  sqlite3_free(pLog);
+}
+
+/*
+** Return the WalRowLog for pWal, lazily acquiring it if not yet set.
+** Returns NULL if apWiData[0] is not yet mapped.
+*/
+static struct WalRowLog *walGetRowLog(Wal *pWal){
+  if( pWal->pRowLog==0 ){
+    if( pWal->nWiData>0 && pWal->apWiData[0] ){
+      pWal->pRowLog = walAcquireRowLog(pWal);
+    }
+  }
+  return pWal->pRowLog;
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
 
 /*
 ** Candidate values for Wal.exclusiveMode.
@@ -2219,6 +2820,9 @@ int sqlite3WalOpen(
 #endif
 
   nByte = sizeof(Wal) + pVfs->szOsFile*2;
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  nByte += pVfs->szOsFile * 2;  /* Extra space for 2 sidecar file descriptors */
+#endif
 
   /* Allocate an instance of struct Wal to return. */
   *ppWal = 0;
@@ -2230,6 +2834,10 @@ int sqlite3WalOpen(
   pRet->pVfs = pVfs;
   pRet->apWalFd[0] = (sqlite3_file*)((char*)pRet+sizeof(Wal));
   pRet->apWalFd[1] = (sqlite3_file*)((char*)pRet+sizeof(Wal)+pVfs->szOsFile);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  pRet->apSidecarFd[0] = (sqlite3_file*)((char*)pRet+sizeof(Wal)+pVfs->szOsFile*2);
+  pRet->apSidecarFd[1] = (sqlite3_file*)((char*)pRet+sizeof(Wal)+pVfs->szOsFile*3);
+#endif
   pRet->pDbFd = pDbFd;
   pRet->readLock = WAL_LOCK_NONE;
   pRet->mxWalSize = mxWalSize;
@@ -2259,6 +2867,9 @@ int sqlite3WalOpen(
     }
     *ppWal = pRet;
     WALTRACE(("WAL%d: opened\n", pRet));
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    walSidecarOpen(pRet);
+#endif
   }
   return rc;
 }
@@ -2973,6 +3584,9 @@ static int walCheckpoint(
           }
           if( rc==SQLITE_OK ){
             AtomicStore(&pInfo->nBackfill, mxSafeFrame); SEH_INJECT_FAULT;
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+            sqlite3WalTrimCommitRows(pWal, iCkpt, mxSafeFrame);
+#endif
           }
         }
         if( rc==SQLITE_OK ){
@@ -2993,7 +3607,21 @@ static int walCheckpoint(
       ** just because there are active readers.  */
       rc = SQLITE_OK;
     }
-    if( bWal2 ) wal2CheckpointFinished(pWal, iCkpt);
+    if( bWal2 ){
+      wal2CheckpointFinished(pWal, iCkpt);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+      /* WAL2: trim the per-file sidecar after checkpoint.  If all frames
+      ** in the WAL file were backfilled, delete the sidecar entirely. */
+      if( rc==SQLITE_OK ){
+        sqlite3WalTrimCommitRows(pWal, iCkpt, mxSafeFrame);
+        /* WAL2 sets nBackfill=1 when all frames are checkpointed.
+        ** Delete the sidecar when the file is fully backfilled. */
+        if( pInfo->nBackfill>0 && mxSafeFrame>0 ){
+          walSidecarDelete(pWal, iCkpt);
+        }
+      }
+#endif
+    }
   }
 
   /* If this is an SQLITE_CHECKPOINT_RESTART or TRUNCATE operation, and the
@@ -3028,6 +3656,11 @@ static int walCheckpoint(
           ** indicate that the log file contains zero valid frames.  */
           walRestartHdr(pWal, salt1);
           rc = sqlite3OsTruncate(pWal->apWalFd[0], 0);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+          /* The WAL has been reset; all sidecar data is now stale.
+          ** Delete the sidecar so the next writer starts fresh. */
+          walSidecarDelete(pWal, 0);
+#endif
         }
         walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
       }
@@ -3227,6 +3860,25 @@ int sqlite3WalClose(
       sqlite3EndBenignMalloc();
     }
     WALTRACE(("WAL%p: closed\n", pWal));
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    /* Close sidecar file descriptors; delete sidecar files if deleting WAL. */
+    {
+      int iSc;
+      for(iSc=0; iSc<2; iSc++){
+        if( pWal->abSidecarOk[iSc] ){
+          sqlite3OsClose(pWal->apSidecarFd[iSc]);
+          pWal->abSidecarOk[iSc] = 0;
+        }
+        if( isDelete && pWal->azSidecar[iSc] ){
+          sqlite3OsDelete(pWal->pVfs, pWal->azSidecar[iSc], 0);
+        }
+        sqlite3_free(pWal->azSidecar[iSc]);
+        pWal->azSidecar[iSc] = 0;
+      }
+    }
+    walReleaseRowLog(pWal->pRowLog);
+    pWal->pRowLog = 0;
+#endif
     sqlite3_free((void *)pWal->apWiData);
     sqlite3_free(pWal);
   }
@@ -4611,10 +5263,263 @@ static u32 walConflictFrame(Wal *pWal, u32 iExternal){
   return iRet;
 }
 
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Search the shared WalRowLog commit list for a WalCommitRowSet entry whose
+** frame range [iMinFrame, iMaxFrame] contains iFrame.  Returns a pointer
+** to the matching entry, or NULL if none is found.  All in-process
+** connections to the same WAL file share the same WalRowLog, so commits
+** recorded by any connection are visible here.
+*/
+static struct WalCommitRowSet *walFindCommitRowSet(Wal *pWal, int iWal, u32 iFrame){
+  struct WalCommitRowSet *p;
+  struct WalRowLog *pLog = walGetRowLog(pWal);
+  if( pLog==0 ) return 0;
+  for(p=pLog->apCommits[iWal]; p; p=p->pNext){
+    if( iFrame>=p->iMinFrame && iFrame<=p->iMaxFrame ) return p;
+  }
+  return 0;
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
+/*
+** Core conflict-scan loop, shared by the full commit check (walLockForCommit),
+** the pre-check (walPreCheck), and the delta check (walDeltaCheck).
+**
+** Scans WAL frames written after pFrom's position up to pHead's current
+** position, checking each frame against pAllRead (bitvec) and
+** pWal->pCurReadRows (row-level lock set).
+**
+**   pFrom  – "start" header: frames at or before pFrom->mxFrame are skipped.
+**            Pass &pWal->hdr for a full scan; pass the pre-check context for
+**            a delta scan.
+**   pHead  – current WAL header (already safely loaded by caller).
+**   pAllRead – bitvec of pages read by this CONCURRENT transaction (may be
+**            NULL when isolation_level=read_committed).
+**   bPreCheck – non-zero when called from walPreCheck().  In this mode the
+**            sidecar has NOT been loaded, so WalRowLog may be incomplete for
+**            cross-process commits.  If a bitvec-hit frame has no in-process
+**            WalCommitRowSet, the frame is skipped (not counted as a conflict)
+**            and *pbNeedSidecar is set to 1, signalling walPreCheck() to
+**            force the delta check to rescan from the snapshot.
+**   pbNeedSidecar – out-param used only when bPreCheck!=0 (may be NULL).
+**
+** Returns SQLITE_OK (no conflict), SQLITE_BUSY_SNAPSHOT (conflict), or an
+** I/O error.  Does NOT acquire or release any lock.
+*/
+static int walScanConflicts(
+  Wal *pWal,
+  PgHdr *pPg1,
+  Bitvec *pAllRead,
+  const WalIndexHdr *pFrom,
+  const WalIndexHdr *pHead,
+  int bPreCheck,
+  int *pbNeedSidecar,
+  u32 *aConflict
+){
+  int rc = SQLITE_OK;
+  int bWal2 = isWalMode2(pWal);
+  int iHash;
+  int nLoop;
+  int iLoop;
+
+  /* Nothing has changed since pFrom — no scan needed. */
+  if( memcmp(pFrom, pHead, sizeof(WalIndexHdr))==0 ) return SQLITE_OK;
+
+  /* Schema-changing transaction: conflicts with every other transaction. */
+  if( pPg1==0 ){
+    u32 bFile = walidxGetFile(pFrom);
+    u32 iFrame = walidxGetMxFrame(pHead, bFile) | (bFile << 31);
+    aConflict[SQLITE_COMMIT_CONFLICT_PGNO] = 1;
+    aConflict[SQLITE_COMMIT_CONFLICT_FRAME] = iFrame;
+    return SQLITE_BUSY_SNAPSHOT;
+  }
+
+  nLoop = 1+(bWal2 && walidxGetFile(pHead)!=walidxGetFile(pFrom));
+
+  assert( nLoop==1 || nLoop==2 );
+  for(iLoop=0; rc==SQLITE_OK && iLoop<nLoop; iLoop++){
+    u32 iFirst;               /* First (external) wal frame to check */
+    int iLastHash;            /* Last hash to check this loop */
+    u32 mxFrame;              /* Last (external) wal frame to check */
+
+    if( bWal2==0 ){
+      assert( iLoop==0 );
+      /*
+      ** iFirst is the frame after the last one pFrom already covers.
+      ** If the WAL salt changed (WAL was checkpointed and restarted since
+      ** pFrom was captured), scan the new WAL from frame 1.
+      */
+      iFirst = pFrom->mxFrame+1;
+      if( memcmp(pFrom->aSalt, (u32*)pHead->aSalt, sizeof(u32)*2) ){
+        /* WAL has been reset since pFrom was captured — scan everything. */
+        iFirst = 1;
+      }
+      mxFrame = pHead->mxFrame;
+    }else{
+      int iA = walidxGetFile(pFrom);
+      if( iLoop==0 ){
+        iFirst = walExternalEncode(iA, 1+walidxGetMxFrame(pFrom, iA));
+        mxFrame = walExternalEncode(iA, walidxGetMxFrame(pHead, iA));
+      }else{
+        iFirst = walExternalEncode(!iA, 1);
+        mxFrame = walExternalEncode(!iA, walidxGetMxFrame(pHead, !iA));
+      }
+    }
+    iLastHash = walFramePage(mxFrame);
+
+    for(iHash=walFramePage(iFirst); iHash<=iLastHash; iHash += (1+bWal2)){
+      WalHashLoc sLoc;
+
+      rc = walHashGet(pWal, iHash, &sLoc);
+      if( rc==SQLITE_OK ){
+        u32 i, iMin, iMax;
+        assert( mxFrame>=sLoc.iZero );
+        iMin = (sLoc.iZero >= iFirst) ? 1 : (iFirst - sLoc.iZero);
+        iMax = (iHash==0) ? HASHTABLE_NPAGE_ONE : HASHTABLE_NPAGE;
+        if( iMax>(mxFrame-sLoc.iZero) ) iMax = (mxFrame-sLoc.iZero);
+        for(i=iMin; rc==SQLITE_OK && i<=iMax; i++){
+          PgHdr *pPg;
+          if( sLoc.aPgno[i-1]==1 ){
+            /* Check that the schema cookie has not been modified. If
+            ** it has not, the commit can proceed. */
+            u8 aNew[4];
+            u8 *aOld = &((u8*)pPg1->pData)[40];
+            int sz;
+            i64 iOff;
+            u32 iFrame = sLoc.iZero + i;
+            int iWal = 0;
+            if( bWal2 ){
+              iWal = walExternalDecode(iFrame, &iFrame);
+            }
+            sz = pHead->szPage;
+            sz = (sz&0xfe00) + ((sz&0x0001)<<16);
+            iOff = walFrameOffset(iFrame, sz) + WAL_FRAME_HDRSIZE + 40;
+            rc = sqlite3OsRead(pWal->apWalFd[iWal],aNew,sizeof(aNew),iOff);
+            if( rc==SQLITE_OK && memcmp(aOld, aNew, sizeof(aNew)) ){
+              u32 iFrame = walConflictFrame(pWal, sLoc.iZero+i);
+              aConflict[SQLITE_COMMIT_CONFLICT_PGNO] = 1;
+              aConflict[SQLITE_COMMIT_CONFLICT_FRAME] = iFrame;
+              rc = SQLITE_BUSY_SNAPSHOT;
+            }
+          }else if( pAllRead
+                 && sqlite3BitvecTestNotNull(pAllRead, sLoc.aPgno[i-1]) ){
+            int bRowConflict = 1;
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+            /*
+            ** Page-level read-committed: if the connection is in
+            ** read_committed mode and this page was only READ (not dirtied)
+            ** by the current transaction, skip the conflict.  Only pages
+            ** that were actually WRITTEN by our transaction can produce a
+            ** write-write conflict.
+            */
+            if( pWal->bReadCommitted ){
+              PgHdr *pChk = sqlite3PagerLookup(pPg1->pPager, sLoc.aPgno[i-1]);
+              if( pChk ){
+                if( !sqlite3PagerIswriteable(pChk) ){
+                  /* Page was read but not written — skip in RC mode */
+                  bRowConflict = 0;
+                }
+                sqlite3PagerUnref(pChk);
+              }else{
+                /* Page not in cache at all — it was evicted after read;
+                ** conservatively treat as read-only → skip in RC mode */
+                bRowConflict = 0;
+              }
+            }
+#endif /* SQLITE_ENABLE_READ_ISOLATION */
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING)
+            if( bRowConflict && pWal->pCurReadRows ){
+              u32 localFrame;
+              int iWalFile;
+              if( bWal2 ){
+                iWalFile = walExternalDecode(sLoc.iZero+i, &localFrame);
+              }else{
+                iWalFile = 0;
+                localFrame = sLoc.iZero + i;
+              }
+              {
+              struct WalCommitRowSet *pCRS =
+                  walFindCommitRowSet(pWal, iWalFile, localFrame);
+              if( pCRS ){
+                sqlite3 *pDb2 = rowLockSetGetDb(pWal->pCurReadRows);
+                int bRC = pDb2 &&
+#if defined(SQLITE_ENABLE_READ_ISOLATION)
+                          (pDb2->flags & SQLITE_ReadCommitted)!=0;
+#else
+                          0;
+#endif
+                if( rowLockSetHasConflict(pCRS->pRows,
+                                         pWal->pCurReadRows, bRC)==0 ){
+                  bRowConflict = 0;
+                  /* Record this page for 3-way merge if db1 has it dirty */
+                  {
+                    PgHdr *pDirty = sqlite3PagerLookup(pPg1->pPager,
+                                                       sLoc.aPgno[i-1]);
+                    if( pDirty ){
+                      if( sqlite3PagerIswriteable(pDirty) ){
+                        struct WalMergePage *pM = (struct WalMergePage *)
+                            sqlite3MallocZero(sizeof(struct WalMergePage));
+                        if( pM ){
+                          pM->pgno = sLoc.aPgno[i-1];
+                          pM->iFrame = sLoc.iZero + i;
+                          pM->pRows = pCRS->pRows;
+                          pM->pNext = pWal->pMergePages;
+                          pWal->pMergePages = pM;
+                        }
+                      }
+                      sqlite3PagerUnref(pDirty);
+                    }
+                  }
+                }
+              }else if( bPreCheck ){
+                /*
+                ** Pre-check: no in-process WalCommitRowSet for this frame.
+                ** The sidecar (loaded only under write lock) may supply the
+                ** row data that clears this conflict.  Defer to the delta
+                ** check rather than fail now.
+                */
+                if( pbNeedSidecar ) *pbNeedSidecar = 1;
+                bRowConflict = 0;
+              }
+              } /* end extra scope for localFrame decode */
+            }
+#endif
+            if( bRowConflict ){
+              u32 iFrame = walConflictFrame(pWal, sLoc.iZero+i);
+              aConflict[SQLITE_COMMIT_CONFLICT_PGNO] = sLoc.aPgno[i-1];
+              aConflict[SQLITE_COMMIT_CONFLICT_FRAME] = iFrame;
+              rc = SQLITE_BUSY_SNAPSHOT;
+            }
+          }else
+          if( (pPg = sqlite3PagerLookup(pPg1->pPager, sLoc.aPgno[i-1])) ){
+            /*
+            ** Page is in the pager cache but was NOT read by this transaction.
+            ** Two cases: (a) newly allocated by this txn (move it aside), or
+            ** (b) stale cache entry (drop it to stay consistent post-upgrade).
+            */
+            if( sqlite3PagerIswriteable(pPg) ){
+              sqlite3PagerUnref(pPg);
+            }else{
+              sqlite3PcacheDrop(pPg);
+            }
+          }
+        }
+      }
+      if( rc!=SQLITE_OK ) break;
+    }
+  }
+  return rc;
+}
+
 /*
 ** This function does the work of sqlite3WalLockForCommit(). The difference
 ** between this function and sqlite3WalLockForCommit() is that the latter
 ** encloses everything in a SEH_TRY {} block.
+**
+** Acquires the WAL write lock, loads the current WAL header, and delegates
+** the full conflict scan to walScanConflicts() using &pWal->hdr (the
+** transaction's snapshot) as the "from" position.
 */
 static int walLockForCommit(
   Wal *pWal, 
@@ -4623,145 +5528,135 @@ static int walLockForCommit(
   u32 *aConflict
 ){
   int rc = walWriteLock(pWal);
-
-  /* If the database has been modified since this transaction was started,
-  ** check if it is still possible to commit. The transaction can be 
-  ** committed if:
-  **
-  **   a) None of the pages in pList have been modified since the 
-  **      transaction opened, and
-  **
-  **   b) The database schema cookie has not been modified since the
-  **      transaction was started.
-  */
   if( rc==SQLITE_OK ){
     WalIndexHdr head;
-
     if( walIndexLoadHdr(pWal, &head) ){
-      /* This branch is taken if the wal-index header is corrupted. This 
-      ** occurs if some other writer has crashed while committing a 
-      ** transaction to this database since the current concurrent transaction
-      ** was opened.  */
+      /* Corrupted wal-index header: another writer crashed mid-commit. */
       rc = SQLITE_BUSY_SNAPSHOT;
-    }else if( memcmp(&pWal->hdr, (void*)&head, sizeof(WalIndexHdr))!=0 ){
-      int bWal2 = isWalMode2(pWal);
-      int iHash;
-      int nLoop = 1+(bWal2 && walidxGetFile(&head)!=walidxGetFile(&pWal->hdr));
-      int iLoop;
+    }else{
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+      /* Load any sidecar commit records left by a previous process.  Must be
+      ** done under the write lock (already held) and after we have the current
+      ** WAL header so we can validate the generation cookie (aSalt). */
+      walSidecarLoad(pWal, &head, 0);
+      if( isWalMode2(pWal) ) walSidecarLoad(pWal, &head, 1);
+#endif
+      rc = walScanConflicts(pWal, pPg1, pAllRead,
+                            &pWal->hdr, &head, 0, NULL, aConflict);
+    }
+  }
+  pWal->nPriorFrame = walGetPriorFrame(&pWal->hdr);
+  return rc;
+}
 
-      if( pPg1==0 ){
-        /* If pPg1==0, then the current transaction modified the database
-        ** schema. This means it conflicts with all other transactions. */
-        u32 bFile = walidxGetFile(&pWal->hdr);
-        u32 iFrame = walidxGetMxFrame(&head, bFile) | (bFile << 31);
-        aConflict[SQLITE_COMMIT_CONFLICT_PGNO] = 1;
-        aConflict[SQLITE_COMMIT_CONFLICT_FRAME] = iFrame;
-        rc = SQLITE_BUSY_SNAPSHOT;
-      }
+/*
+** Phase 1 of the two-phase concurrent commit: scan WAL frames for conflicts
+** WITHOUT acquiring the write lock.  Uses the caller's existing read lock.
+**
+** On SQLITE_OK, *pCtx is populated with the WAL header state captured during
+** the scan.  Pass *pCtx unchanged to walDeltaCheck().
+**
+** On SQLITE_BUSY_SNAPSHOT, a genuine conflict was detected and the caller
+** should abort immediately (do not retry; do not proceed to walDeltaCheck).
+**
+** If the WAL index header cannot be read consistently (torn read), returns
+** SQLITE_OK with *pCtx set to &pWal->hdr so walDeltaCheck falls back to a
+** full scan under the write lock — safe and correct.
+*/
+static int walPreCheck(
+  Wal *pWal,
+  PgHdr *pPg1,
+  Bitvec *pAllRead,
+  WalPreCheckCtx *pCtx,
+  u32 *aConflict
+){
+  WalIndexHdr head;
+  int rc;
+  int bNeedSidecar = 0;
 
-      assert( nLoop==1 || nLoop==2 );
-      for(iLoop=0; rc==SQLITE_OK && iLoop<nLoop; iLoop++){
-        u32 iFirst;               /* First (external) wal frame to check */
-        int iLastHash;            /* Last hash to check this loop */
-        u32 mxFrame;              /* Last (external) wal frame to check */
+  /* Compile-time guard: WalPreCheckCtx must be exactly sizeof(WalIndexHdr). */
+  assert( sizeof(WalPreCheckCtx)==sizeof(WalIndexHdr) );
 
-        if( bWal2==0 ){
-          assert( iLoop==0 );
-          /* Special case for wal mode. If this concurrent transaction was
-          ** opened after the entire wal file had been checkpointed, and
-          ** another connection has since wrapped the wal file, then we wish to
-          ** iterate through every frame in the new wal file - not just those
-          ** that follow the current value of pWal->hdr.mxFrame (which will be
-          ** set to the size of the old, now overwritten, wal file). This
-          ** doesn't come up in wal2 mode, as in wal2 mode the client always
-          ** has a PART lock on one of the wal files, preventing it from being
-          ** checkpointed or overwritten. */
-          iFirst = pWal->hdr.mxFrame+1;
-          if( memcmp(pWal->hdr.aSalt, (u32*)head.aSalt, sizeof(u32)*2) ){
-            assert( pWal->readLock==0 );
-            iFirst = 1;
-          }
-          mxFrame = head.mxFrame;
-        }else{
-          int iA = walidxGetFile(&pWal->hdr);
-          if( iLoop==0 ){
-            iFirst = walExternalEncode(iA, 1+walidxGetMxFrame(&pWal->hdr, iA));
-            mxFrame = walExternalEncode(iA, walidxGetMxFrame(&head, iA));
-          }else{
-            iFirst = walExternalEncode(!iA, 1);
-            mxFrame = walExternalEncode(!iA, walidxGetMxFrame(&head, !iA));
-          }
-        }
-        iLastHash = walFramePage(mxFrame);
+  assert( pWal->readLock>=0 );   /* must hold a read lock */
+  assert( pWal->writeLock==0 );  /* must NOT hold write lock */
 
-        for(iHash=walFramePage(iFirst); iHash<=iLastHash; iHash += (1+bWal2)){
-          WalHashLoc sLoc;
+  /* Read the current WAL header speculatively (no write lock needed for
+  ** readers — walIndexWriteHdr holds WAL_WRITE_LOCK and uses a barrier).
+  ** If the read is torn/corrupt, fall back by storing our snapshot header
+  ** as the "checked" state, so walDeltaCheck does a full scan. */
+  if( walIndexLoadHdr(pWal, &head) ){
+    memcpy(pCtx, &pWal->hdr, sizeof(WalIndexHdr));
+    return SQLITE_OK;
+  }
 
-          rc = walHashGet(pWal, iHash, &sLoc);
-          if( rc==SQLITE_OK ){
-            u32 i, iMin, iMax;
-            assert( mxFrame>=sLoc.iZero );
-            iMin = (sLoc.iZero >= iFirst) ? 1 : (iFirst - sLoc.iZero);
-            iMax = (iHash==0) ? HASHTABLE_NPAGE_ONE : HASHTABLE_NPAGE;
-            if( iMax>(mxFrame-sLoc.iZero) ) iMax = (mxFrame-sLoc.iZero);
-            for(i=iMin; rc==SQLITE_OK && i<=iMax; i++){
-              PgHdr *pPg;
-              if( sLoc.aPgno[i-1]==1 ){
-                /* Check that the schema cookie has not been modified. If
-                ** it has not, the commit can proceed. */
-                u8 aNew[4];
-                u8 *aOld = &((u8*)pPg1->pData)[40];
-                int sz;
-                i64 iOff;
-                u32 iFrame = sLoc.iZero + i;
-                int iWal = 0;
-                if( bWal2 ){
-                  iWal = walExternalDecode(iFrame, &iFrame);
-                }
-                sz = head.szPage;
-                sz = (sz&0xfe00) + ((sz&0x0001)<<16);
-                iOff = walFrameOffset(iFrame, sz) + WAL_FRAME_HDRSIZE + 40;
-                rc = sqlite3OsRead(pWal->apWalFd[iWal],aNew,sizeof(aNew),iOff);
-                if( rc==SQLITE_OK && memcmp(aOld, aNew, sizeof(aNew)) ){
-                  u32 iFrame = walConflictFrame(pWal, sLoc.iZero+i);
-                  aConflict[SQLITE_COMMIT_CONFLICT_PGNO] = 1;
-                  aConflict[SQLITE_COMMIT_CONFLICT_FRAME] = iFrame;
-                  rc = SQLITE_BUSY_SNAPSHOT;
-                }
-              }else if( sqlite3BitvecTestNotNull(pAllRead, sLoc.aPgno[i-1]) ){
-                u32 iFrame = walConflictFrame(pWal, sLoc.iZero+i);
-                aConflict[SQLITE_COMMIT_CONFLICT_PGNO] = sLoc.aPgno[i-1];
-                aConflict[SQLITE_COMMIT_CONFLICT_FRAME] = iFrame;
-                rc = SQLITE_BUSY_SNAPSHOT;
-              }else
-              if( (pPg = sqlite3PagerLookup(pPg1->pPager, sLoc.aPgno[i-1])) ){
-                /* Page aPgno[i], which is present in the pager cache, has been
-                ** modified since the current CONCURRENT transaction was
-                ** started.  However it was not read by the current
-                ** transaction, so is not a conflict. There are two
-                ** possibilities: (a) the page was allocated at the of the file
-                ** by the current transaction or (b) was present in the cache
-                ** at the start of the transaction.
-                **
-                ** For case (a), do nothing. This page will be moved within the
-                ** database file by the commit code to avoid the conflict. The
-                ** call to PagerUnref() is to release the reference grabbed by
-                ** the sqlite3PagerLookup() above.  
-                **
-                ** In case (b), drop the page from the cache - otherwise
-                ** following the snapshot upgrade the cache would be
-                ** inconsistent with the database as stored on disk. */
-                if( sqlite3PagerIswriteable(pPg) ){
-                  sqlite3PagerUnref(pPg);
-                }else{
-                  sqlite3PcacheDrop(pPg);
-                }
-              }
-            }
-          }
-          if( rc!=SQLITE_OK ) break;
-        }
-      }
+  /* Capture the header we scanned up to. */
+  memcpy(pCtx, &head, sizeof(WalIndexHdr));
+
+  /* If nothing changed since our snapshot, no scan needed. */
+  if( memcmp(&pWal->hdr, &head, sizeof(WalIndexHdr))==0 ) return SQLITE_OK;
+
+  /*
+  ** Perform the conflict scan.  walSidecarLoad() is intentionally skipped
+  ** here (it requires the write lock).  When a bitvec-hit frame has no
+  ** in-process WalRowLog entry, walScanConflicts() sets bNeedSidecar=1 and
+  ** skips the frame rather than reporting a false conflict.
+  **
+  ** If any frames were skipped (bNeedSidecar=1), we reset pCtx to the
+  ** snapshot header so that walDeltaCheck() is forced to redo the full scan
+  ** with the sidecar loaded, catching those frames correctly.
+  */
+  rc = walScanConflicts(pWal, pPg1, pAllRead,
+                        &pWal->hdr, &head, 1, &bNeedSidecar, aConflict);
+  if( rc==SQLITE_OK && bNeedSidecar ){
+    /* Some frames could only be verified with sidecar data.  Force
+    ** walDeltaCheck() to rescan from the snapshot start by presenting
+    ** the snapshot header as the "already checked" position. */
+    memcpy(pCtx, &pWal->hdr, sizeof(WalIndexHdr));
+  }
+  return rc;
+}
+
+/*
+** Phase 2 of the two-phase concurrent commit: acquire the WAL write lock
+** and scan only the frames written since walPreCheck() (the "delta").
+**
+** pCtx holds the WAL header captured at the end of the pre-check; the delta
+** is all frames after pCtx->mxFrame (WAL1) up to the current head.
+**
+** On SQLITE_OK the write lock is held.  Caller must write frames and then
+** call sqlite3WalEndWriteTransaction() to release the lock.
+**
+** On SQLITE_BUSY (lock temporarily unavailable) the caller may retry using
+** the busy-handler — the pre-check context is still valid.
+**
+** On SQLITE_BUSY_SNAPSHOT a genuine conflict was found in the delta.
+** The write lock is released before returning; caller must abort.
+*/
+static int walDeltaCheck(
+  Wal *pWal,
+  PgHdr *pPg1,
+  Bitvec *pAllRead,
+  const WalPreCheckCtx *pCtx,
+  u32 *aConflict
+){
+  const WalIndexHdr *pFrom = (const WalIndexHdr *)pCtx;
+  int rc = walWriteLock(pWal);
+  if( rc==SQLITE_OK ){
+    WalIndexHdr head;
+    if( walIndexLoadHdr(pWal, &head) ){
+      rc = SQLITE_BUSY_SNAPSHOT;
+    }else{
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+      /* Sidecar must be loaded under the write lock. */
+      walSidecarLoad(pWal, &head, 0);
+      if( isWalMode2(pWal) ) walSidecarLoad(pWal, &head, 1);
+#endif
+      /* Scan only the delta: frames committed after the pre-check. */
+      rc = walScanConflicts(pWal, pPg1, pAllRead, pFrom, &head, 0, NULL, aConflict);
+    }
+    if( rc!=SQLITE_OK ){
+      walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+      pWal->writeLock = 0;
     }
   }
   pWal->nPriorFrame = walGetPriorFrame(&pWal->hdr);
@@ -4805,6 +5700,44 @@ int sqlite3WalLockForCommit(
   int rc = SQLITE_OK;
   SEH_TRY {
     rc = walLockForCommit(pWal, pPg1, pAllRead, piConflict);
+  } SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  return rc;
+}
+
+/*
+** Public wrapper for walPreCheck(): phase 1 of the two-phase concurrent
+** commit.  Runs without the WAL write lock.  See walPreCheck() for details.
+*/
+int sqlite3WalPreCheck(
+  Wal *pWal,
+  PgHdr *pPg1,
+  Bitvec *pAllRead,
+  WalPreCheckCtx *pCtx,
+  u32 *aConflict
+){
+  int rc = SQLITE_OK;
+  SEH_TRY {
+    rc = walPreCheck(pWal, pPg1, pAllRead, pCtx, aConflict);
+  } SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
+  return rc;
+}
+
+/*
+** Public wrapper for walDeltaCheck(): phase 2 of the two-phase concurrent
+** commit.  Acquires the write lock and scans only the delta frames.
+** On SQLITE_OK the write lock is held; caller must write frames then
+** call sqlite3WalEndWriteTransaction().
+*/
+int sqlite3WalDeltaCheck(
+  Wal *pWal,
+  PgHdr *pPg1,
+  Bitvec *pAllRead,
+  const WalPreCheckCtx *pCtx,
+  u32 *aConflict
+){
+  int rc = SQLITE_OK;
+  SEH_TRY {
+    rc = walDeltaCheck(pWal, pPg1, pAllRead, pCtx, aConflict);
   } SEH_EXCEPT( rc = SQLITE_IOERR_IN_PAGE; )
   return rc;
 }
@@ -4856,8 +5789,156 @@ int sqlite3WalEndWriteTransaction(Wal *pWal){
     pWal->iReCksum = 0;
     pWal->truncateOnCommit = 0;
   }
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  pWal->pCurReadRows = 0;
+  sqlite3WalClearMergePages(pWal);
+#endif
   return SQLITE_OK;
 }
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Store the current transaction's row lock set on the WAL so it can be
+** used during conflict detection.  Called from sqlite3PagerSetReadRowSet()
+** just before committing starts.
+*/
+void sqlite3WalSetReadRowSet(Wal *pWal, struct RowLockSet *pRowLocks){
+  if( pWal ) pWal->pCurReadRows = pRowLocks;
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Set the read-committed flag on this WAL connection.  When bRC is true,
+** page-level read-only conflicts are skipped: a page that was read (in
+** pAllRead) but NOT dirtied by the current transaction will not trigger
+** SQLITE_BUSY_SNAPSHOT even if another transaction modified it.
+** Row-level locking (if compiled) also respects this flag.
+*/
+void sqlite3WalSetReadCommitted(Wal *pWal, int bRC){
+  if( pWal ) pWal->bReadCommitted = bRC;
+}
+#endif /* SQLITE_ENABLE_READ_ISOLATION && !SQLITE_OMIT_CONCURRENT */
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Record that a transaction just committed rows described by pRows,
+** occupying WAL frames [iMinFrame, iMaxFrame].  The new entry is prepended
+** to the shared WalRowLog so it is visible to all in-process connections
+** via walFindCommitRowSet().  The WAL takes ownership of the RowLockSet;
+** the caller must not free it.
+*/
+void sqlite3WalRecordCommitRows(
+  Wal *pWal,
+  struct RowLockSet *pRows,
+  u32 iMinFrame,
+  u32 iMaxFrame
+){
+  struct WalCommitRowSet *p;
+  struct WalRowLog *pLog;
+  int iWal;
+  if( pWal==0 || pRows==0 ) return;
+  pLog = walGetRowLog(pWal);
+  if( pLog==0 ) return;
+  /* Determine which WAL file this commit landed in */
+  iWal = isWalMode2(pWal) ? walidxGetFile(&pWal->hdr) : 0;
+  /* Detach the RowLockSet from its creating db connection so it can safely
+  ** outlive that connection (all further allocs/frees use sqlite3_free). */
+  rowLockSetDetach(pRows);
+  p = (struct WalCommitRowSet *)sqlite3MallocZero(sizeof(struct WalCommitRowSet));
+  if( p ){
+    p->iMinFrame = iMinFrame;
+    p->iMaxFrame = iMaxFrame;
+    p->pRows = pRows;
+    p->pNext = pLog->apCommits[iWal];
+    pLog->apCommits[iWal] = p;
+    /* Option C: persist this commit record to the sidecar row-log so it
+    ** survives process death and is visible to other processes on re-open. */
+    walSidecarAppend(pWal, iWal, pRows, iMinFrame, iMaxFrame);
+  }
+}
+
+/*
+** Return the current mxFrame value for the WAL.
+*/
+u32 sqlite3WalGetMxFrame(Wal *pWal){
+  if( pWal==0 ) return 0;
+  if( isWalMode2(pWal) ){
+    return walidxGetMxFrame(&pWal->hdr, walidxGetFile(&pWal->hdr));
+  }
+  return pWal->hdr.mxFrame;
+}
+
+/*
+** Return the number of WalCommitRowSet entries currently in the shared
+** WalRowLog.  Used by SQLITE_TESTCTRL_WAL_ROWLOG_COUNT.
+*/
+int sqlite3WalGetRowLogCount(Wal *pWal){
+  int n = 0;
+  int i;
+  struct WalCommitRowSet *p;
+  struct WalRowLog *pLog;
+  if( pWal==0 ) return 0;
+  pLog = walGetRowLog(pWal);
+  if( pLog==0 ) return 0;
+  for(i=0; i<2; i++){
+    for(p=pLog->apCommits[i]; p; p=p->pNext) n++;
+  }
+  return n;
+}
+
+/*
+** Remove WalCommitRowSet entries whose frames have all been checkpointed
+** (i.e. iMaxFrame <= nBackfill).  Called after each successful checkpoint.
+** The RowLockSet objects embedded in trimmed entries are freed here.
+*/
+void sqlite3WalTrimCommitRows(Wal *pWal, int iWal, u32 nBackfill){
+  struct WalCommitRowSet **pp;
+  struct WalRowLog *pLog;
+  if( pWal==0 ) return;
+  pLog = walGetRowLog(pWal);
+  if( pLog==0 ) return;
+  pp = &pLog->apCommits[iWal];
+  while( *pp ){
+    struct WalCommitRowSet *p = *pp;
+    if( p->iMaxFrame<=nBackfill ){
+      *pp = p->pNext;
+      rowLockSetFree(p->pRows);
+      sqlite3_free(p);
+    }else{
+      pp = &p->pNext;
+    }
+  }
+}
+
+/*
+** Return the list of WalMergePage entries accumulated during the last
+** walLockForCommit() call.  The caller is responsible for freeing this
+** list (or transferring ownership) before the write transaction ends.
+*/
+struct WalMergePage *sqlite3WalGetMergePages(Wal *pWal){
+  if( pWal==0 ) return 0;
+  return pWal->pMergePages;
+}
+
+/*
+** Free all WalMergePage entries that were recorded for the current commit
+** and reset the list to NULL.  Must be called after the merge has been
+** applied (successfully or otherwise) so that stale entries are not used
+** in a future commit.
+*/
+void sqlite3WalClearMergePages(Wal *pWal){
+  struct WalMergePage *p;
+  if( pWal==0 ) return;
+  p = pWal->pMergePages;
+  pWal->pMergePages = 0;
+  while( p ){
+    struct WalMergePage *pNext = p->pNext;
+    sqlite3_free(p);
+    p = pNext;
+  }
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
 
 /*
 ** If any data has been written (but not committed) to the log file, this

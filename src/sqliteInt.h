@@ -1429,6 +1429,12 @@ typedef int VList;
 ** pointer types (i.e. FuncDef) defined above.
 */
 #include "os.h"
+/* Forward-declare RowLockSet types so they are available to pager.h
+** (which is included before btree.h where the full definitions live). */
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+typedef struct RowLockEntry RowLockEntry;
+typedef struct RowLockSet   RowLockSet;
+#endif
 #include "pager.h"
 #include "btree.h"
 #include "vdbe.h"
@@ -1550,7 +1556,7 @@ struct Schema {
 ** The number of different kinds of things that can be limited
 ** using the sqlite3_limit() interface.
 */
-#define SQLITE_N_LIMIT (SQLITE_LIMIT_PARSER_DEPTH+1)
+#define SQLITE_N_LIMIT (SQLITE_LIMIT_ROW_LOCK_ENTRIES+1)
 
 /*
 ** Lookaside malloc is a set of fixed-size buffers that can be used
@@ -1897,6 +1903,10 @@ struct sqlite3 {
 #define SQLITE_AttachCreate   HI(0x00010) /* ATTACH allowed to create new dbs */
 #define SQLITE_AttachWrite    HI(0x00020) /* ATTACH allowed to open for write */
 #define SQLITE_Comments       HI(0x00040) /* Enable SQL comments */
+#define SQLITE_RowLevelLocking HI(0x00080) /* Row-level conflict detection in CONCURRENT */
+#if defined(SQLITE_ENABLE_READ_ISOLATION)
+#define SQLITE_ReadCommitted   HI(0x00100) /* Read-committed isolation: ignore ROW_LOCK_READ at commit */
+#endif
 
 #define SQLITE_NoopUpdate     0x01000000  /* UPDATE operations are no-ops */
 /* Flags used only if debugging */

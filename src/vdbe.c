@@ -3876,6 +3876,18 @@ case OP_Savepoint: {
           db->isTransactionSavepoint = 1;
         }else{
           db->nSavepoint++;
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+          /* Notify btrees so row-lock generation tracking works even when
+          ** statement journals are not used (e.g. WAL mode simple inserts).
+          ** Use db->nSavepoint (after increment) as the level. */
+          {
+            int ii;
+            for(ii=0; ii<db->nDb; ii++){
+              sqlite3BtreeSavepoint(db->aDb[ii].pBt,
+                                    SAVEPOINT_BEGIN, db->nSavepoint);
+            }
+          }
+#endif
         }
 
         /* Link the new savepoint into the database handle's list. */
@@ -4440,6 +4452,9 @@ case OP_OpenWrite:
 #ifndef SQLITE_OMIT_CONCURRENT
     if( db->eConcurrent==CONCURRENT_OPEN && p2==1 && iDb!=1 ){
       db->eConcurrent = CONCURRENT_SCHEMA;
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING)
+      sqlite3BtreeDiscardRowLocks(db);
+#endif
     }
 #endif
     assert( OPFLAG_FORDELETE==BTREE_FORDELETE );
@@ -8251,7 +8266,12 @@ case OP_TableLock: {
   u8 isWriteLock = (u8)pOp->p3;
 #ifndef SQLITE_OMIT_CONCURRENT
   if( isWriteLock && db->eConcurrent && pOp->p2==1 && pOp->p1!=1 ){
-    db->eConcurrent = CONCURRENT_SCHEMA;
+    if( db->eConcurrent != CONCURRENT_SCHEMA ){
+      db->eConcurrent = CONCURRENT_SCHEMA;
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING)
+      sqlite3BtreeDiscardRowLocks(db);
+#endif
+    }
   }
 #endif
   if( isWriteLock || 0==(db->flags&SQLITE_ReadUncommit) ){

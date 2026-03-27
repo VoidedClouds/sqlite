@@ -1,0 +1,136 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking — basic write-conflict detection.
+#
+# Sections:
+#   1.x  Baseline — non-overlapping rowid writes commit without conflict
+#   2.x  Overlapping rowid writes produce SQLITE_BUSY_SNAPSHOT
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-basic
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_basic.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--------------------------------------------------------------------------
+# Section 1: Non-overlapping rowid writes
+#
+# Two CONCURRENT transactions each insert a different rowid into the same
+# table.  With row-level locking the row sets are disjoint, so the second
+# commit should succeed even though both transactions touched the same
+# b-tree pages.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 1.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 inserts rowid 10, db2 inserts rowid 20 — no row overlap.
+  do_test 1.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(10, 'ten');
+    }
+  } {}
+
+  do_test 1.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(20, 'twenty');
+      COMMIT;
+    }
+  } {}
+
+  # db1 should commit cleanly — rowid 10 and 20 have no overlap.
+  # Cross-process sidecar load enables row-level conflict check for tn=1 too;
+  # non-overlapping rowids mean no conflict for either tn value.
+  do_test 1.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 1.$tn.4 {
+    sql1 { SELECT k FROM t1 ORDER BY k }
+  } {1 2 3 4 5 10 20}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 2: Overlapping rowid writes produce conflict
+#
+# Two CONCURRENT transactions both write the same rowid.  The second
+# commit must return SQLITE_BUSY_SNAPSHOT.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 2.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(99, 'db1');
+    }
+  } {}
+
+  # db2 writes and commits SAME rowid 99.
+  do_test 2.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(99, 'db2');
+      COMMIT;
+    }
+  } {}
+
+  # db1 tries to commit — should get BUSY_SNAPSHOT (write-write on rowid 99).
+  do_test 2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }] \
+              [code1 { sqlite3_get_autocommit db }]
+  } {1 SQLITE_BUSY_SNAPSHOT 0}
+
+  do_test 2.$tn.4 { sql1 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+finish_test

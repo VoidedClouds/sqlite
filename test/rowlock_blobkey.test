@@ -1,0 +1,230 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking — index b-tree (BLOBKEY) conflict detection.
+#
+# Sections:
+#   8.x  Phase 3.2 / 6.1: BLOBKEY writes tracked and compared byte-for-byte.
+#        8.1  Non-overlapping index-key inserts — no conflict
+#        8.2  Same-key BLOBKEY write-write conflict (WITHOUT ROWID table)
+#        8.3  Non-overlapping WITHOUT ROWID writes — no conflict
+#        8.4  Savepoint rollback removes BLOBKEY write — no false conflict
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-blobkey
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_blobkey.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--- 8.1: Two concurrent inserts with different indexed values ---------
+# Both writers touch the same (only) index page; BLOBKEY tracking resolves
+# the non-overlap so the second commit succeeds without conflict (tn==2).
+
+do_multiclient_test tn {
+
+  do_test 8.1.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8a(k INTEGER PRIMARY KEY, v TEXT);
+      CREATE INDEX idx8a ON t8a(v);
+      INSERT INTO t8a VALUES(1,'aaa'),(2,'bbb'),(3,'ccc');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 opens CONCURRENT and inserts a row with v='zzz'.
+  do_test 8.1.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t8a VALUES(10, 'zzz'); }
+  } {}
+
+  # db2 inserts a different row (v='www') and commits.
+  do_test 8.1.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t8a VALUES(20, 'www'); COMMIT; }
+  } {}
+
+  # db1 commits:
+  #   Cross-process sidecar load enables BLOBKEY row-level check for tn=1 too;
+  #   BLOBKEY keys differ — no conflict; merge ensures both index entries present.
+  do_test 8.1.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # After commit, both rows must be found, and the index must return
+  # the expected rowid for each value.
+  do_test 8.1.$tn.4 {
+    sql1 { SELECT k, v FROM t8a ORDER BY k }
+  } {1 aaa 2 bbb 3 ccc 10 zzz 20 www}
+
+  # Verify the index is consistent (both entries searchable).
+  if {1} {
+    do_test 8.1.$tn.5 {
+      sql1 { SELECT k FROM t8a WHERE v='www' }
+    } {20}
+    do_test 8.1.$tn.6 {
+      sql1 { SELECT k FROM t8a WHERE v='zzz' }
+    } {10}
+  }
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+#--- 8.2: Write-write conflict on the same BLOBKEY entry (WITHOUT ROWID) ---
+# A WITHOUT ROWID table has no INTKEY b-tree; the single BLOBKEY b-tree
+# is the only place writes land.  Two concurrent updates to the SAME key
+# must produce SQLITE_BUSY_SNAPSHOT.
+
+do_multiclient_test tn {
+
+  do_test 8.2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8b(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+      INSERT INTO t8b VALUES('alpha','one'),('beta','two'),('gamma','three');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 updates key='alpha'.
+  do_test 8.2.$tn.1 {
+    sql1 { BEGIN CONCURRENT; UPDATE t8b SET v='ONE' WHERE k='alpha'; }
+  } {}
+
+  # db2 also updates key='alpha' and commits.
+  do_test 8.2.$tn.2 {
+    sql2 { BEGIN CONCURRENT; UPDATE t8b SET v='ONE-too' WHERE k='alpha'; COMMIT; }
+  } {}
+
+  # db1 must get SQLITE_BUSY_SNAPSHOT: both wrote the same BLOBKEY entry.
+  do_test 8.2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    set ext [code1 { sqlite3_extended_errcode db }]
+    list $rc $ext
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+#--- 8.3: Non-overlapping WITHOUT ROWID writes on the same BLOBKEY page ----
+# Two concurrent updates to DIFFERENT keys in a WITHOUT ROWID table.
+# Same-process (tn==2): BLOBKEY tracking resolves no-conflict; merge
+#   preserves both updates.
+# Cross-process (tn==1): WAL write lock — "database is locked".
+
+do_multiclient_test tn {
+
+  do_test 8.3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8c(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+      INSERT INTO t8c VALUES('alpha','one'),('beta','two'),('gamma','three');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 updates key='alpha'.
+  do_test 8.3.$tn.1 {
+    sql1 { BEGIN CONCURRENT; UPDATE t8c SET v='ONE_updated' WHERE k='alpha'; }
+  } {}
+
+  # db2 updates a DIFFERENT key='beta' and commits.
+  do_test 8.3.$tn.2 {
+    sql2 { BEGIN CONCURRENT; UPDATE t8c SET v='TWO_updated' WHERE k='beta'; COMMIT; }
+  } {}
+
+  # db1 commits:
+  #   Cross-process sidecar load enables BLOBKEY row-level check for tn=1 too;
+  #   different keys — no conflict; both updates visible.
+  do_test 8.3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 8.3.$tn.4 {
+    sql1 { SELECT k, v FROM t8c ORDER BY k }
+  } {alpha ONE_updated beta TWO_updated gamma three}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+#--- 8.4: Savepoint rollback removes BLOBKEY write — no false conflict -----
+# db1 writes BLOBKEY key 'alpha' inside a savepoint, then rolls it back.
+# db2 then writes the same key 'alpha' and commits.
+# db1 should commit cleanly (its write to 'alpha' was rolled back).
+
+do_multiclient_test tn {
+
+  do_test 8.4.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8d(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+      INSERT INTO t8d VALUES('alpha','one'),('beta','two'),('gamma','three');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1: update 'gamma' (will keep), savepoint, update 'alpha' (will roll back).
+  do_test 8.4.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t8d SET v='GAMMA_updated' WHERE k='gamma';
+        SAVEPOINT sp1;
+          UPDATE t8d SET v='ALPHA_temp' WHERE k='alpha';
+        ROLLBACK TO sp1;
+        RELEASE sp1;
+    }
+  } {}
+
+  # db2 updates 'alpha' and commits.
+  do_test 8.4.$tn.2 {
+    sql2 { BEGIN CONCURRENT; UPDATE t8d SET v='ALPHA_db2' WHERE k='alpha'; COMMIT; }
+  } {}
+
+  # db1 commits:
+  #   Cross-process sidecar load enables BLOBKEY row-level check for tn=1 too;
+  #   BLOBKEY 'alpha' was rolled back from db1's write set — no overlap.
+  do_test 8.4.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    code1 { list $::rc [sqlite3_extended_errcode db] }
+  } {0 SQLITE_OK}
+
+  do_test 8.4.$tn.4 {
+    sql1 { SELECT k, v FROM t8d ORDER BY k }
+  } {alpha ALPHA_db2 beta two gamma GAMMA_updated}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+finish_test

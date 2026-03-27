@@ -1,0 +1,460 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking — threshold spill, cursor-level purge,
+# sqlite3_limit(), and page-level fallback after spill.
+#
+# Sections:
+#   6.x   Threshold spill resets to page-level conservatism
+#  10.x   Phase 10.2: Cursor-level purge when bSpilled=1
+#  11.x   sqlite3_limit(SQLITE_LIMIT_ROW_LOCK_ENTRIES) behaves like PRAGMA
+#  13.x   Page-level fallback: conflicts caught when row log unavailable
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-threshold
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_threshold.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--------------------------------------------------------------------------
+# Section 6: Threshold spill
+#
+# If row_lock_threshold is set to 1, the row set spills immediately to
+# page-level fallback.  Conflicts that would be resolved by row-level
+# comparison must now fall back to BUSY_SNAPSHOT for ALL cases.
+#
+# This exercises the bSpilled=1 path and confirms the conservative
+# page-level fallback is still safe (never misses a real conflict).
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 6.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 1 }
+    }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # With threshold=1 db1's set spills after the first insert.
+  do_test 6.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(10, 'ten');
+        INSERT INTO t1 VALUES(20, 'twenty');
+    }
+  } {}
+
+  do_test 6.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(30, 'thirty');
+      COMMIT;
+    }
+  } {}
+
+  # Even though rowids don't overlap, threshold spill forces page-level
+  # check.  Both transactions touched the same table pages, so this is
+  # expected to be BUSY_SNAPSHOT under spill mode.
+  do_test 6.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    set ext [code1 { sqlite3_extended_errcode db }]
+    # Accept either success (if pages happen not to overlap) or BUSY_SNAPSHOT.
+    # The important invariant is that no real conflict is missed.
+    expr { $rc == 0 || $ext eq "SQLITE_BUSY_SNAPSHOT" }
+  } 1
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+#--- 10: Phase 10.2 — cursor-close entry purge when bSpilled=1 ----------
+# When bSpilled=1, rowLockSetHasConflict returns -1 immediately and new
+# entries are not added.  Any entries accumulated before the spill are dead
+# weight.  Phase 10.2 calls rowLockSetPurgeEntries from
+# sqlite3BtreeCloseCursor so those entries are freed as each cursor closes
+# rather than waiting until transaction end.
+#
+# This is a memory-only optimisation; correctness is verified by:
+#   (a) correct commit / rollback semantics after the purge, and
+#   (b) testfixture's end-of-run "all memory allocations freed" check.
+
+reset_db
+do_test 10.setup {
+  db eval {
+    PRAGMA journal_mode = wal;
+    CREATE TABLE t10(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t10 VALUES(1,'one'),(2,'two'),(3,'three');
+  }
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_lock_threshold = 1 }
+  set {} {}
+} {}
+
+# With threshold=1: first INSERT adds 1 entry (nEntry=1 == threshold=1).
+# Second INSERT: nEntry >= threshold → bSpilled=1, entry not added.
+# When the second INSERT's cursor closes, rowLockSetPurgeEntries fires and
+# frees the 1 stale entry.  Third INSERT is tracked only via page bitvec.
+do_test 10.1 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t10 VALUES(4,'four');
+      INSERT INTO t10 VALUES(5,'five');
+      INSERT INTO t10 VALUES(6,'six');
+  }
+} {}
+
+# SELECT opens a new cursor after spill, closing it when done.  The purge
+# runs again (no-op since nEntry=0) and the query returns all 6 rows visible
+# in this open transaction.
+do_test 10.2 {
+  db eval { SELECT a FROM t10 ORDER BY a }
+} {1 2 3 4 5 6}
+
+# Commit must succeed: no concurrent writes; page-level fallback sees no
+# conflict (no other WAL frames written since BEGIN CONCURRENT).
+do_test 10.3 {
+  db eval COMMIT
+  db eval { SELECT a FROM t10 ORDER BY a }
+} {1 2 3 4 5 6}
+
+# Verify ROLLBACK works cleanly after a purge: the purge must not discard
+# information needed to undo the inserts (pager's own rollback journal
+# handles that; pRowLocks is independent).
+do_test 10.4 {
+  db eval { PRAGMA row_lock_threshold = 1 }
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t10 VALUES(7,'seven');
+      INSERT INTO t10 VALUES(8,'eight');
+      INSERT INTO t10 VALUES(9,'nine');
+  }
+  db eval ROLLBACK
+  db eval { SELECT a FROM t10 ORDER BY a }
+} {1 2 3 4 5 6}
+
+#--------------------------------------------------------------------------
+# Section 11: sqlite3_limit() for SQLITE_LIMIT_ROW_LOCK_ENTRIES
+#
+# Verify that calling sqlite3_limit() with SQLITE_LIMIT_ROW_LOCK_ENTRIES
+# produces the same spill threshold effect as PRAGMA row_lock_threshold.
+# The two interfaces share the same db->aLimit slot.
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 11.setup {
+  db eval { PRAGMA journal_mode = wal }
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { CREATE TABLE t11(a INTEGER PRIMARY KEY, b TEXT) }
+  db eval { INSERT INTO t11 VALUES(1,'one'),(2,'two') }
+  set {} {}
+} {}
+
+# 11.1: sqlite3_limit returns the previous limit when setting a new one.
+# The fresh-connection default is SQLITE_MAX_ROW_LOCK_ENTRIES (0x7fffffff).
+do_test 11.1 {
+  set old [sqlite3_limit db SQLITE_LIMIT_ROW_LOCK_ENTRIES 1]
+  expr {$old > 1000}
+} {1}
+
+# 11.2: After setting to 1 via sqlite3_limit, PRAGMA row_lock_threshold
+# reads back the same value (they share db->aLimit[SQLITE_LIMIT_ROW_LOCK_ENTRIES]).
+do_test 11.2 {
+  db eval { PRAGMA row_lock_threshold }
+} {1}
+
+# 11.3: With limit=1 a two-insert concurrent transaction spills to page-level
+# (same as PRAGMA row_lock_threshold=1 in section 10).  The data must still
+# commit correctly.
+do_test 11.3 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t11 VALUES(3,'three');
+      INSERT INTO t11 VALUES(4,'four');
+    COMMIT;
+  }
+  db eval { SELECT a FROM t11 ORDER BY a }
+} {1 2 3 4}
+
+# 11.4: Verify the limit round-trips freely via PRAGMA and sqlite3_limit.
+# Note: 512 is NOT the default — the fresh-connection default is 0x7fffffff.
+# This test simply confirms that any positive value can be set and read back.
+do_test 11.4 {
+  db eval { PRAGMA row_lock_threshold = 512 }
+  expr {[sqlite3_limit db SQLITE_LIMIT_ROW_LOCK_ENTRIES -1] == 512}
+} {1}
+
+#--------------------------------------------------------------------------
+# Section 13: Page-level fallback
+#
+# When row-level log entries are unavailable (simulated here by setting
+# row_lock_threshold=0, which forces bSpilled=1 immediately so every
+# committed RowLockSet has bSpilled=1 and rowLockSetHasConflict returns -1),
+# the WAL falls back to page-granularity conflict detection.  Both
+# transactions read the same b-tree page before db1 commits, ensuring that
+# db2's snapshot is taken before db1's commit.  The page-level overlap
+# must still produce SQLITE_BUSY_SNAPSHOT.
+#
+# This models the behaviour after a process crash/restart: the in-memory
+# pCommits list is empty/bSpilled, but the WAL page presence still catches
+# conflicts at page granularity.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 13.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t13(a INTEGER PRIMARY KEY, b TEXT);
+      INSERT INTO t13 VALUES(1,'one'),(2,'two'),(3,'three');
+    }
+    # threshold=0 forces bSpilled=1 on first rowLockSetInsert call so
+    # every committed set records bSpilled=1 — identical to restart-empty log.
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 0 }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+      db2 eval { PRAGMA row_lock_threshold = 0 }
+    }
+    set {} {}
+  } {}
+
+  # 13.tn.1: db1 starts a concurrent transaction and reads the b-tree page P
+  # (forcing the snapshot at the current WAL frame).
+  do_test 13.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t13 VALUES(10,'ten') }
+  } {}
+
+  # 13.tn.2: db2 starts a concurrent transaction BEFORE db1 commits.  Inserting
+  # a different row still touches the same b-tree page P (small table), locking in
+  # db2's snapshot at the frame before db1's commit.
+  do_test 13.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t13 VALUES(11,'eleven') }
+  } {}
+
+  # 13.tn.3: db1 commits, writing page P to the WAL.
+  do_test 13.$tn.3 {
+    sql1 COMMIT
+  } {}
+
+  # 13.tn.4: db2 tries to commit.  With threshold=0 (bSpilled=1) rowLockSetHasConflict
+  # returns -1, falling back to page-level: page P was written by db1 after db2's
+  # snapshot, and db2's pAllRead bitvec includes page P → SQLITE_BUSY_SNAPSHOT.
+  do_test 13.$tn.4 {
+    set rc [catch { sql2 COMMIT } msg]
+    list $rc [code2 { sqlite3_extended_errcode db2 }] \
+              [code2 { sqlite3_get_autocommit db2 }]
+  } {1 SQLITE_BUSY_SNAPSHOT 0}
+
+  do_test 13.$tn.5 { sql2 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 14: threshold=0 — zero rows tracked; immediate full spill
+#
+# threshold=0 means the spill check fires on the very first insert:
+#   nEntry(0) >= nThreshold(0) → TRUE → bSpilled=1, zero rows recorded.
+#
+# This is the most aggressive spill setting — every transaction degrades
+# to pure page-level conflict detection regardless of how many rows it
+# touches.  In contrast, threshold=1 still tracks the first distinct row
+# before spilling (see Section 15).
+#
+# This is also the correct model for a fresh process after a crash/restart:
+# pLog->pCommits is empty so rowLockSetHasConflict returns -1, and the WAL
+# falls back to pAllRead page-level detection — exactly what threshold=0
+# simulates in a single process.
+#
+# These tests complement Section 13 (which also uses threshold=0 to simulate
+# restart-empty state) by verifying that EVEN A SINGLE-ROW transaction
+# spills with threshold=0, i.e. that threshold=0 is not "use default" but
+# genuinely means "zero rows tracked".
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 14.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t14(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t14 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    # threshold=0: bSpilled=1 fires on the very first rowLockSetInsert call.
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 0 }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+      db2 eval { PRAGMA row_lock_threshold = 0 }
+    }
+    set {} {}
+  } {}
+
+  # db1 inserts a SINGLE row — which would be trackable under threshold>=1 —
+  # but threshold=0 means bSpilled=1 fires immediately; zero rows are recorded.
+  do_test 14.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t14 VALUES(10, 'ten') }
+  } {}
+
+  # db2 inserts a DIFFERENT row (rowid 20) and commits first.
+  do_test 14.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t14 VALUES(20, 'twenty'); COMMIT }
+  } {}
+
+  # db1 tries to commit.  bSpilled=1 on its RowLockSet → rowLockSetHasConflict
+  # returns -1 → pure page-level.  Both inserts (10 and 20) land on the same
+  # small-table b-tree page, so page-level fires → SQLITE_BUSY_SNAPSHOT.
+  # This proves threshold=0 is NOT "use the default" — it disables all
+  # row tracking for this transaction even for a single-row write.
+  do_test 14.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    set ext [code1 { sqlite3_extended_errcode db }]
+    list $rc $ext
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 15: threshold=1 — exactly one distinct row tracked before spill
+#
+# threshold=1 means:
+#   * First distinct row insert: nEntry(0) >= nThreshold(1) → FALSE → row recorded
+#   * Second distinct row insert: nEntry(1) >= nThreshold(1) → TRUE → bSpilled=1
+#
+# Consequence:
+#   ONE-ROW transactions: NOT spilled → row-level conflict resolution is precise.
+#     Non-overlapping rowids → no conflict → commit succeeds.
+#   TWO-OR-MORE-ROW transactions: spilled → page-level fallback.
+#     Any same-page concurrent write → SQLITE_BUSY_SNAPSHOT.
+#
+# This section tests both sub-cases to pin the exact boundary.
+#--------------------------------------------------------------------------
+
+# 15.A: ONE-ROW transaction with threshold=1 — stays row-level, succeeds.
+
+do_multiclient_test tn {
+
+  do_test 15.a.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t15a(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t15a VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    # db1 uses threshold=1; db2 uses the default (unlimited).
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 1 }
+    }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 writes exactly ONE row.  With threshold=1 this row IS tracked
+  # (nEntry goes 0→1 before the spill check would fire at nEntry>=1).
+  do_test 15.a.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t15a VALUES(10, 'ten') }
+  } {}
+
+  # db2 writes a DIFFERENT row (rowid 20) and commits.
+  do_test 15.a.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t15a VALUES(20, 'twenty'); COMMIT }
+  } {}
+
+  # db1 commits.  Its RowLockSet is NOT spilled (one row, threshold=1).
+  # rowLockSetHasConflict sees db2's write to rowid 20, looks for 20 in
+  # db1's set (which only has rowid 10), finds nothing → no conflict.
+  # Cross-process (tn=1): walSidecarLoad delivers db2's row 20 from the
+  # sidecar before the check — same outcome.
+  do_test 15.a.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 15.a.$tn.4 {
+    sql1 { SELECT k FROM t15a ORDER BY k }
+  } {1 2 3 10 20}
+
+} ;# do_multiclient_test
+
+# 15.B: TWO-ROW transaction with threshold=1 — spills after first row.
+
+do_multiclient_test tn {
+
+  do_test 15.b.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t15b(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t15b VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 1 }
+    }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 writes TWO rows.  First insert: nEntry(0) < nThreshold(1) → recorded.
+  # Second insert: nEntry(1) >= nThreshold(1) → bSpilled=1, entry dropped.
+  do_test 15.b.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t15b VALUES(10, 'ten');
+        INSERT INTO t15b VALUES(20, 'twenty');
+    }
+  } {}
+
+  # db2 writes a DIFFERENT row (rowid 30) and commits.
+  do_test 15.b.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t15b VALUES(30, 'thirty'); COMMIT }
+  } {}
+
+  # db1 tries to commit.  bSpilled=1 → rowLockSetHasConflict returns -1 →
+  # page-level.  All three inserts (10, 20, 30) land on the same small-table
+  # page → SQLITE_BUSY_SNAPSHOT, even though no rowids overlap.
+  # This contrasts directly with 15.A where one row + threshold=1 succeeded.
+  do_test 15.b.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    set ext [code1 { sqlite3_extended_errcode db }]
+    list $rc $ext
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+finish_test

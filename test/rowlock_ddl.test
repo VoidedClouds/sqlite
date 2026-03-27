@@ -1,0 +1,118 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking — DDL detection / CONCURRENT_SCHEMA discard.
+#
+# Sections:
+#   9.x  Phase 8.2: DDL inside BEGIN CONCURRENT discards pRowLocks.
+#        9.1  DDL + no concurrent commits → clean commit
+#        9.2  DDL + concurrent write to a different row → BUSY_SNAPSHOT
+#             (CONCURRENT_SCHEMA conflicts with any concurrent WAL advance)
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-ddl
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_ddl.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--- 9: Phase 8.2 — DDL inside BEGIN CONCURRENT discards pRowLocks ---------
+# When DDL fires during a CONCURRENT transaction, eConcurrent is promoted to
+# CONCURRENT_SCHEMA and pRowLocks is discarded.  Without this discard, stale
+# row-level entries could allow the row-level conflict check to bypass a
+# legitimate page-level conflict, causing incorrect commit success.
+#
+# 9.1: DDL + no concurrent commits → db1 commits cleanly (no conflict).
+# 9.2: DDL + concurrent write to a DIFFERENT row → BUSY_SNAPSHOT because
+#      CONCURRENT_SCHEMA conflicts with any concurrent WAL advance,
+#      regardless of which rows were written.
+
+do_multiclient_test tn {
+
+  do_test 9.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t9(a INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t9 VALUES(1,'one'),(2,'two'),(3,'three');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # --- 9.1: DDL inside CONCURRENT with no concurrent commit → clean commit ---
+
+  # db1: BEGIN CONCURRENT, update row 1, then CREATE INDEX (DDL).
+  # The DDL transitions eConcurrent to CONCURRENT_SCHEMA and discards pRowLocks.
+  do_test 9.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t9 SET v='ONE' WHERE a=1;
+        CREATE INDEX t9i ON t9(v);
+    }
+  } {}
+
+  # No concurrent db2 writes; db1 commits cleanly.
+  do_test 9.$tn.2 {
+    sql1 COMMIT
+  } {}
+
+  do_test 9.$tn.3 {
+    sql1 { SELECT a, v FROM t9 ORDER BY a }
+  } {1 ONE 2 two 3 three}
+
+  # --- 9.2: DDL inside CONCURRENT + concurrent write to different row -------
+  # db1 updates row 2 and does DDL (CREATE INDEX t9j).
+  # db2 updates a completely different row (a=3) and commits.
+  # db1 commits: CONCURRENT_SCHEMA conflicts with any concurrent WAL advance
+  # → BUSY_SNAPSHOT for both tn==1 (cross-process) and tn==2 (same-process).
+  # (Without Phase 8.2: stale pRowLocks could bypass the conflict check
+  #  when rows don't overlap, incorrectly returning SQLITE_OK.)
+
+  do_test 9.$tn.4 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t9 SET v='TWO' WHERE a=2;
+        CREATE INDEX t9j ON t9(a, v);
+    }
+  } {}
+
+  # db2 writes a completely different row and commits.
+  do_test 9.$tn.5 {
+    sql2 { BEGIN CONCURRENT; UPDATE t9 SET v='THREE' WHERE a=3; COMMIT; }
+  } {}
+
+  # db1 commit: CONCURRENT_SCHEMA + WAL advanced → BUSY_SNAPSHOT.
+  do_test 9.$tn.6 {
+    set rc [catch { sql1 COMMIT } msg]
+    set ext [code1 { sqlite3_extended_errcode db }]
+    list $rc $ext
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+finish_test

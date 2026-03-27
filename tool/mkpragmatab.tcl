@@ -405,6 +405,19 @@ set pragma_def {
   NAME: analysis_limit
   FLAG: Result0
 
+  NAME: isolation_level
+  FLAG: Result0
+  IF:   defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+
+  NAME: row_level_locking
+  TYPE: FLAG
+  ARG:  SQLITE_RowLevelLocking
+  IF:   defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+
+  NAME: row_lock_threshold
+  FLAG: Result0
+  IF:   defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+
   NAME: optimize
   FLAG: Result1 NeedSchema
 

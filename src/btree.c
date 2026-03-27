@@ -761,6 +761,682 @@ static void btreePtrmapCheck(BtShared *pBt, Pgno nPage){
 # define btreePtrmapCheck(y,z) 
 #endif /* SQLITE_OMIT_CONCURRENT */
 
+/*
+** Row-level locking helpers.
+** Only compiled when both SQLITE_ENABLE_ROW_LEVEL_LOCKING and
+** SQLITE_OMIT_CONCURRENT are absent.
+*/
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+
+#define ROW_LOCK_HASH_INITIAL 16
+
+/* Forward declarations for helper functions defined later in this file */
+static i64  btreeDecodeSerialInt(u32, const u8*);
+static int  btreeRawRecordCmp(const u8*, int, const u8*, int, int);
+
+/*
+** Allocate and return a new, empty RowLockSet.  Returns NULL on OOM.
+** The nThreshold is set from the current db limit so that the caller
+** can check bSpilled without holding a mutex.
+*/
+RowLockSet *rowLockSetNew(sqlite3 *db){
+  RowLockSet *p;
+  /* Use the global heap (not db-specific lookaside) so that the set can
+  ** safely outlive the creating connection after rowLockSetDetach(). */
+  p = (RowLockSet*)sqlite3MallocZero(sizeof(RowLockSet));
+  if( p ){
+    p->aHash = (RowLockEntry**)sqlite3MallocZero(
+                    sizeof(RowLockEntry*)*ROW_LOCK_HASH_INITIAL);
+    if( p->aHash==0 ){
+      sqlite3_free(p);
+      return 0;
+    }
+    p->nAlloc = ROW_LOCK_HASH_INITIAL;
+    p->nThreshold = db ? db->aLimit[SQLITE_LIMIT_ROW_LOCK_ENTRIES]
+                       : SQLITE_MAX_ROW_LOCK_ENTRIES;
+    p->db = db;
+  }
+  return p;
+}
+
+/*
+** Free all memory associated with a RowLockSet, including all its entries.
+*/
+void rowLockSetFree(RowLockSet *pSet){
+  if( pSet ){
+    int i;
+    for(i=0; i<pSet->nAlloc; i++){
+      RowLockEntry *pEntry = pSet->aHash[i];
+      while( pEntry ){
+        RowLockEntry *pNext = pEntry->pNext;
+        sqlite3_free(pEntry->pKey);
+        sqlite3_free(pEntry);
+        pEntry = pNext;
+      }
+    }
+    sqlite3_free(pSet->aHash);
+    sqlite3_free(pSet->aSvpt);
+    sqlite3_free(pSet);
+  }
+}
+
+/*
+** Phase 10.2: Purge all hash entries from pSet but keep the set structure
+** alive.  Called from sqlite3BtreeCloseCursor when bSpilled==1 to reclaim
+** the memory occupied by entries that will never be used for conflict
+** detection (rowLockSetHasConflict returns -1 immediately when bSpilled).
+** Correctness is unaffected: the page-level pAllRead bitvec handles the
+** fallback for this transaction.
+*/
+static void rowLockSetPurgeEntries(RowLockSet *pSet){
+  if( pSet && pSet->nEntry>0 ){
+    int i;
+    for(i=0; i<pSet->nAlloc; i++){
+      RowLockEntry *pEntry = pSet->aHash[i];
+      while( pEntry ){
+        RowLockEntry *pNext = pEntry->pNext;
+        sqlite3_free(pEntry->pKey);
+        sqlite3_free(pEntry);
+        pEntry = pNext;
+      }
+      pSet->aHash[i] = 0;
+    }
+    pSet->nEntry = 0;
+  }
+}
+
+/*
+** Detach a RowLockSet from its creating database connection by clearing its
+** db pointer.  After this call all allocations associated with the set are
+** managed via plain sqlite3_free(), so the set can safely outlive the
+** connection that created it (e.g. after transfer to the shared WalRowLog).
+** Must be called before the creating connection is closed.
+*/
+void rowLockSetDetach(RowLockSet *pSet){
+  if( pSet ) pSet->db = 0;
+}
+
+/*
+** Phase 8.2: Discard the row-level lock set for every btree attached to db.
+**
+** Called when a CONCURRENT transaction is promoted to CONCURRENT_SCHEMA
+** (i.e., DDL is detected mid-transaction).  After this call pBt->pRowLocks
+** is NULL for all btrees, so sqlite3BtreeCommitPhaseOne will skip the call
+** to sqlite3PagerSetReadRowSet() and walLockForCommit will not attempt any
+** row-level conflict bypass.  The transaction then falls back to the
+** page-level pAllRead bitvec for its commit-time conflict detection, which
+** is the correct conservative behaviour after a schema change.
+*/
+void sqlite3BtreeDiscardRowLocks(sqlite3 *db){
+  int i;
+  for(i=0; i<db->nDb; i++){
+    Btree *p = db->aDb[i].pBt;
+    if( p ){
+      BtShared *pBt = p->pBt;
+      rowLockSetFree(pBt->pRowLocks);
+      pBt->pRowLocks = 0;
+    }
+  }
+}
+
+/*
+** Serialize pSet into a malloc'd buffer for the Option C sidecar row-log.
+**
+** Buffer layout (no mxFrame prefix; no trailing checksum — those are
+** added by the WAL layer in walSidecarAppend):
+**
+**   u32  nEntry       total number of entries
+**   u8   bSpilled     1 if set was truncated; page-level required
+**   u8   reserved[3]  zero
+**   per-entry data (INTKEY or BLOBKEY as described in plan-rowLevelLocking.md)
+**
+** INTKEY  (pKey==NULL): u8 eType, u8 flags=0x01, u16 pad(0),
+**                       u32 iRoot, i64 iKey   — 16 bytes
+** BLOBKEY (pKey!=NULL): u8 eType, u8 flags=0x02, u16 nKeyField,
+**                       u32 iRoot, u32 nKey, u8 pKey[nKey] — 12+nKey bytes
+**
+** Returns a sqlite3_malloc'd buffer on success (caller must sqlite3_free).
+** Returns NULL on OOM; *pnOut is undefined in that case.
+*/
+u8 *rowLockSetSerialize(const RowLockSet *pSet, u32 *pnOut){
+  u32 nBuf, nEntry;
+  u8 *aBuf;
+  int i, off;
+  const RowLockEntry *pE;
+
+  /* First pass: count entries and total byte size */
+  nEntry = 0;
+  nBuf   = 8;  /* u32 nEntry + u8 bSpilled + u8[3] reserved */
+  for(i=0; i<pSet->nAlloc; i++){
+    for(pE=pSet->aHash[i]; pE; pE=pE->pNext){
+      nEntry++;
+      nBuf += (pE->pKey==0) ? 16 : (u32)(12 + pE->nKey);
+    }
+  }
+
+  aBuf = (u8*)sqlite3_malloc64(nBuf ? nBuf : 1);
+  if( aBuf==0 ) return 0;
+
+  /* Serialize header */
+  sqlite3Put4byte(aBuf+0, nEntry);
+  aBuf[4] = pSet->bSpilled;
+  aBuf[5] = aBuf[6] = aBuf[7] = 0;
+
+  /* Serialize entries */
+  off = 8;
+  for(i=0; i<pSet->nAlloc; i++){
+    for(pE=pSet->aHash[i]; pE; pE=pE->pNext){
+      if( pE->pKey==0 ){
+        /* INTKEY: 16 bytes */
+        aBuf[off]   = pE->eType;
+        aBuf[off+1] = 0x01;  /* flags: INTKEY */
+        aBuf[off+2] = aBuf[off+3] = 0;
+        sqlite3Put4byte(aBuf+off+4,  pE->iRoot);
+        sqlite3Put4byte(aBuf+off+8,  (u32)((u64)pE->iRowid >> 32));
+        sqlite3Put4byte(aBuf+off+12, (u32)(pE->iRowid & 0xFFFFFFFFu));
+        off += 16;
+      }else{
+        /* BLOBKEY: 12+nKey bytes */
+        aBuf[off]   = pE->eType;
+        aBuf[off+1] = 0x02;  /* flags: BLOBKEY */
+        aBuf[off+2] = (u8)((pE->nKeyField >> 8) & 0xFF);
+        aBuf[off+3] = (u8)( pE->nKeyField       & 0xFF);
+        sqlite3Put4byte(aBuf+off+4,  pE->iRoot);
+        sqlite3Put4byte(aBuf+off+8,  (u32)pE->nKey);
+        memcpy(aBuf+off+12, pE->pKey, pE->nKey);
+        off += 12 + pE->nKey;
+      }
+    }
+  }
+
+  *pnOut = nBuf;
+  return aBuf;
+}
+
+/*
+** Compute a hash bucket index for a BLOBKEY entry (iRoot, pKey, nKey)
+** over a table of nAlloc buckets.
+** If nKeyField > 0, hash only data from the first nKeyField serialized record
+** fields (so records with the same PK but different non-PK values land in
+** the same bucket).  If nKeyField==0, hash the full key blob.
+*/
+static unsigned int rowLockBlobHashKF(
+  Pgno iRoot, const u8 *pKey, int nKey, int nKeyField, int nAlloc
+){
+  unsigned int h = (unsigned int)((u64)iRoot * 2654435761ULL);
+  if( nKeyField > 0 && nKey >= 1 ){
+    /*
+    ** Hash only the DATA bytes of the first nKeyField fields, not the
+    ** header (which contains type codes for ALL fields including non-PK ones
+    ** that would differ when non-PK values change for the same PK).
+    */
+    u32 szHdr, idx;
+    u32 dStart, dOff;
+    int f;
+    if( pKey[0]<0x80 ){
+      szHdr = pKey[0]; idx = 1;
+    } else {
+      idx = sqlite3GetVarint32(pKey, &szHdr);
+    }
+    dStart = szHdr;  /* data area starts right after the header */
+    dOff = dStart;
+    for(f=0; f<nKeyField && idx<szHdr; f++){
+      u32 st;
+      if( pKey[idx]<0x80 ){
+        st = pKey[idx]; idx++;
+      } else {
+        idx += sqlite3GetVarint32(&pKey[idx], &st);
+      }
+      dOff += sqlite3VdbeSerialTypeLen(st);
+    }
+    if( f >= nKeyField && (int)dOff <= nKey ){
+      /* Hash only the data bytes for the first nKeyField fields */
+      int i;
+      for(i=(int)dStart; i<(int)dOff; i++) h = h * 31 + pKey[i];
+      return h % (unsigned int)nAlloc;
+    }
+    /* Fallthrough: couldn't parse — hash full key */
+    {
+      int i;
+      for(i=0; i<nKey; i++) h = h * 31 + pKey[i];
+    }
+  } else {
+    int i;
+    for(i=0; i<nKey; i++) h = h * 31 + pKey[i];
+  }
+  return h % (unsigned int)nAlloc;
+}
+
+/*
+** Grow the hash table in pSet to 2x its current size.
+** Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+static int rowLockSetGrow(RowLockSet *pSet){
+  int nNew = pSet->nAlloc * 2;
+  RowLockEntry **aNew;
+  int i;
+  aNew = (RowLockEntry**)sqlite3MallocZero(sizeof(RowLockEntry*)*nNew);
+  if( aNew==0 ) return SQLITE_NOMEM_BKPT;
+  for(i=0; i<pSet->nAlloc; i++){
+    RowLockEntry *pEntry = pSet->aHash[i];
+    while( pEntry ){
+      RowLockEntry *pNext = pEntry->pNext;
+      unsigned int h;
+      if( pEntry->pKey ){
+        h = rowLockBlobHashKF(pEntry->iRoot, pEntry->pKey, pEntry->nKey,
+                              pEntry->nKeyField, nNew);
+      }else{
+        h = (unsigned int)(
+            ((u64)pEntry->iRoot*2654435761ULL ^ (u64)(u32)pEntry->iRowid)
+            % (unsigned int)nNew);
+      }
+      pEntry->pNext = aNew[h];
+      aNew[h] = pEntry;
+      pEntry = pNext;
+    }
+  }
+  sqlite3_free(pSet->aHash);
+  pSet->aHash = aNew;
+  pSet->nAlloc = nNew;
+  return SQLITE_OK;
+}
+
+/*
+** Insert a row-lock entry (iRoot, iRowid, eType) into pSet.
+** If an entry already exists for (iRoot, iRowid):
+**   - upgrade to WRITE if eType==ROW_LOCK_WRITE
+**   - otherwise leave unchanged
+** If nEntry >= nThreshold, set bSpilled=1 and return without inserting.
+** Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+static int rowLockSetInsert(RowLockSet *pSet, Pgno iRoot, i64 iRowid, u8 eType){
+  unsigned int h;
+  RowLockEntry *pEntry;
+
+  if( pSet==0 ) return SQLITE_OK;
+  if( pSet->bSpilled ) return SQLITE_OK;
+
+  h = (unsigned int)(
+      ((u64)iRoot*2654435761ULL ^ (u64)(u32)iRowid)
+      % (unsigned int)pSet->nAlloc);
+
+  /* Search for existing entry */
+  for(pEntry=pSet->aHash[h]; pEntry; pEntry=pEntry->pNext){
+    if( pEntry->iRoot==iRoot && pEntry->iRowid==iRowid ){
+      if( eType==ROW_LOCK_WRITE ) pEntry->eType = ROW_LOCK_WRITE;
+      return SQLITE_OK;
+    }
+  }
+
+  /* Check threshold */
+  if( pSet->nEntry >= pSet->nThreshold ){
+    pSet->bSpilled = 1;
+    return SQLITE_OK;
+  }
+
+  /* Grow hash table if needed */
+  if( pSet->nEntry >= pSet->nAlloc ){
+    int rc = rowLockSetGrow(pSet);
+    if( rc!=SQLITE_OK ) return rc;
+    /* Recalculate hash after resize */
+    h = (unsigned int)(
+        ((u64)iRoot*2654435761ULL ^ (u64)(u32)iRowid)
+        % (unsigned int)pSet->nAlloc);
+  }
+
+  pEntry = (RowLockEntry*)sqlite3Malloc(sizeof(RowLockEntry));
+  if( pEntry==0 ) return SQLITE_NOMEM_BKPT;
+  pEntry->iRoot  = iRoot;
+  pEntry->iRowid = iRowid;
+  pEntry->pKey   = 0;
+  pEntry->nKey   = 0;
+  pEntry->eType  = eType;
+  pEntry->iGen   = pSet->iGenCur;
+  pEntry->pNext  = pSet->aHash[h];
+  pSet->aHash[h] = pEntry;
+  pSet->nEntry++;
+  return SQLITE_OK;
+}
+
+/*
+** Insert a BLOBKEY row-lock entry (iRoot, pKey[0..nKey-1], eType) into pSet.
+** Semantics for existing entries and threshold spillover mirror
+** rowLockSetInsert().  A copy of pKey is made and owned by the entry.
+** Returns SQLITE_OK or SQLITE_NOMEM.
+*/
+static int rowLockSetInsertBlob(
+  RowLockSet *pSet,
+  Pgno iRoot,
+  const void *pKey,
+  int nKey,
+  int nKeyField,   /* Number of PK/key fields for comparison (0=all) */
+  u8 eType
+){
+  unsigned int h;
+  RowLockEntry *pEntry;
+  u8 *pKeyCopy;
+
+  if( pSet==0 || nKey<=0 ) return SQLITE_OK;
+  if( pSet->bSpilled ) return SQLITE_OK;
+
+  h = rowLockBlobHashKF(iRoot, (const u8*)pKey, nKey, nKeyField, pSet->nAlloc);
+
+  /* Search for an existing entry with the same PK key.
+  ** For nKeyField>0 (WITHOUT ROWID), compare only the first nKeyField fields
+  ** so that two records with the same PK but different non-PK values match. */
+  for(pEntry=pSet->aHash[h]; pEntry; pEntry=pEntry->pNext){
+    if( pEntry->iRoot==iRoot && pEntry->pKey!=0 ){
+      int cmp = btreeRawRecordCmp(pEntry->pKey, pEntry->nKey,
+                                  (const u8*)pKey, nKey, nKeyField);
+      if( cmp==0 ){
+        /* Same PK: update to WRITE if needed, and refresh full key if larger */
+        if( eType==ROW_LOCK_WRITE ) pEntry->eType = ROW_LOCK_WRITE;
+        /* If the new key is a different blob (non-PK columns differ), update it
+        ** so that the merge can find the right cell in T2's page. */
+        if( pEntry->nKey!=nKey || memcmp(pEntry->pKey, pKey, nKey)!=0 ){
+          u8 *pNewKey = (u8*)sqlite3Malloc(nKey);
+          if( pNewKey ){
+            sqlite3_free(pEntry->pKey);
+            memcpy(pNewKey, pKey, nKey);
+            pEntry->pKey  = pNewKey;
+            pEntry->nKey  = nKey;
+          }
+          /* If malloc fails, keep the old key; merge may still find it */
+        }
+        return SQLITE_OK;
+      }
+    }
+  }
+
+  /* Check threshold */
+  if( pSet->nEntry >= pSet->nThreshold ){
+    pSet->bSpilled = 1;
+    return SQLITE_OK;
+  }
+
+  /* Grow hash table if needed */
+  if( pSet->nEntry >= pSet->nAlloc ){
+    int rc = rowLockSetGrow(pSet);
+    if( rc!=SQLITE_OK ) return rc;
+    /* Recalculate hash after resize */
+    h = rowLockBlobHashKF(iRoot, (const u8*)pKey, nKey, nKeyField, pSet->nAlloc);
+  }
+
+  pKeyCopy = (u8*)sqlite3Malloc(nKey);
+  if( pKeyCopy==0 ) return SQLITE_NOMEM_BKPT;
+  memcpy(pKeyCopy, pKey, nKey);
+
+  pEntry = (RowLockEntry*)sqlite3Malloc(sizeof(RowLockEntry));
+  if( pEntry==0 ){
+    sqlite3_free(pKeyCopy);
+    return SQLITE_NOMEM_BKPT;
+  }
+  pEntry->iRoot     = iRoot;
+  pEntry->iRowid    = 0;
+  pEntry->pKey      = pKeyCopy;
+  pEntry->nKey      = nKey;
+  pEntry->nKeyField = nKeyField;
+  pEntry->eType     = eType;
+  pEntry->iGen      = pSet->iGenCur;
+  pEntry->pNext     = pSet->aHash[h];
+  pSet->aHash[h]    = pEntry;
+  pSet->nEntry++;
+  return SQLITE_OK;
+}
+
+/*
+** Deserialize a body buffer (as produced by rowLockSetSerialize) back into
+** a new RowLockSet.  Buffer format:
+**   [u32 nEntry][u8 bSpilled][u8 reserved[3]][per-entry data ...]
+**
+** INTKEY  entry (flags=0x01): u8 eType, u8 flags, u16 pad,
+**                              u32 iRoot, i64 iKey  — 16 bytes total
+** BLOBKEY entry (flags=0x02): u8 eType, u8 flags, u16 nKeyField,
+**                              u32 iRoot, u32 nKey, u8 pKey[nKey]
+**                              — (12 + nKey) bytes total
+**
+** This is the companion to rowLockSetSerialize() in wal.c (Option C).
+** The mxFrame/iMinFrame prefix and trailing checksum are stripped by the
+** caller (walSidecarLoad) before this function is called.
+**
+** Returns a new detached RowLockSet on success, NULL on OOM or corrupt data.
+** The caller must eventually call rowLockSetFree().
+*/
+RowLockSet *rowLockSetDeserialize(const u8 *aBody, int nBody){
+  u32 nEntry;
+  int i, off;
+  RowLockSet *pSet;
+
+  if( nBody<8 ) return 0;
+  nEntry = sqlite3Get4byte(aBody+0);
+  /* aBody[4] = bSpilled; aBody[5..7] = reserved — not needed for inserting */
+
+  pSet = rowLockSetNew(0);   /* db=NULL → uses sqlite3_malloc throughout */
+  if( pSet==0 ) return 0;
+
+  off = 8;   /* entries start after [nEntry(4)][bSpilled(1)][reserved(3)] */
+  for(i=0; i<(int)nEntry; i++){
+    u8 flags, eType;
+    Pgno iRoot;
+    if( off+2 > nBody ) goto corrupt;
+    eType = aBody[off+0];
+    flags = aBody[off+1];
+    if( flags==0x01 ){
+      /* INTKEY: 16 bytes */
+      i64 iKey;
+      if( off+16 > nBody ) goto corrupt;
+      iRoot = sqlite3Get4byte(aBody+off+4);
+      iKey  = (i64)(  ((u64)sqlite3Get4byte(aBody+off+8)  << 32)
+                    |  (u64)sqlite3Get4byte(aBody+off+12)       );
+      if( rowLockSetInsert(pSet, iRoot, iKey, eType)!=SQLITE_OK ) goto oom;
+      off += 16;
+    }else if( flags==0x02 ){
+      /* BLOBKEY: 12+nKey bytes */
+      int nKeyField, nKey;
+      if( off+12 > nBody ) goto corrupt;
+      nKeyField = ((int)aBody[off+2] << 8) | (int)aBody[off+3];
+      iRoot     = sqlite3Get4byte(aBody+off+4);
+      nKey      = (int)sqlite3Get4byte(aBody+off+8);
+      if( off+12+nKey > nBody ) goto corrupt;
+      if( rowLockSetInsertBlob(pSet, iRoot, aBody+off+12, nKey, nKeyField,
+                               eType)!=SQLITE_OK ) goto oom;
+      off += 12 + nKey;
+    }else{
+      goto corrupt;
+    }
+  }
+  return pSet;
+
+oom:
+corrupt:
+  rowLockSetFree(pSet);
+  return 0;
+}
+
+/*
+** Open savepoint level nSvpt on pSet (if not already open).
+** Mirrors btreePtrmapBegin().
+*/
+static int rowLockSetBegin(RowLockSet *pSet, int nSvpt){
+  if( pSet && nSvpt > pSet->nSvpt ){
+    int i;
+    if( nSvpt > pSet->nSvptAlloc ){
+      int nNew = pSet->nSvptAlloc ? pSet->nSvptAlloc*2 : 4;
+      u32 *aNew;
+      while( nNew < nSvpt ) nNew *= 2;
+      aNew = sqlite3Realloc(pSet->aSvpt, sizeof(u32)*nNew);
+      if( aNew==0 ) return SQLITE_NOMEM_BKPT;
+      pSet->aSvpt = aNew;
+      pSet->nSvptAlloc = nNew;
+    }
+    for(i = pSet->nSvpt; i < nSvpt; i++){
+      /* Each new savepoint level gets a fresh generation value.           */
+      /* Entries added during savepoint i carry iGen == aSvpt[i];         */
+      /* rollback removes entries where iGen >= aSvpt[iSvpt].             */
+      pSet->iGenCur++;
+      pSet->aSvpt[i] = pSet->iGenCur;
+    }
+    pSet->nSvpt = nSvpt;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Commit (op==SAVEPOINT_RELEASE) or roll back (op==SAVEPOINT_ROLLBACK)
+** savepoint iSvpt on pSet.  Mirrors btreePtrmapEnd().
+*/
+static void rowLockSetEnd(RowLockSet *pSet, int op, int iSvpt){
+  if( pSet==0 ) return;
+  assert( op==SAVEPOINT_ROLLBACK || op==SAVEPOINT_RELEASE );
+  assert( iSvpt>=0 || (iSvpt==-1 && op==SAVEPOINT_ROLLBACK) );
+  if( iSvpt < 0 ){
+    /* Full transaction rollback — clear all entries */
+    int i;
+    for(i=0; i<pSet->nAlloc; i++){
+      RowLockEntry *p = pSet->aHash[i];
+      while( p ){
+        RowLockEntry *pNext = p->pNext;
+        sqlite3_free(p->pKey);
+        sqlite3_free(p);
+        p = pNext;
+      }
+      pSet->aHash[i] = 0;
+    }
+    pSet->nEntry = 0;
+    pSet->nSvpt  = 0;
+    pSet->bSpilled = 0;
+    pSet->iGenCur  = 0;
+    return;
+  }
+  if( iSvpt >= pSet->nSvpt ) return;
+  if( op==SAVEPOINT_ROLLBACK ){
+    /* Remove all entries whose generation >= aSvpt[iSvpt].
+    ** aSvpt[k] is set when rowLockSetBegin(pSet, k+1) is called, which now
+    ** happens both at user SAVEPOINT BEGIN and at statement-transaction BEGIN.
+    ** Entries added before savepoint iSvpt have iGen < aSvpt[iSvpt]; entries
+    ** added inside the savepoint have iGen >= aSvpt[iSvpt]. */
+    u32 iGen = pSet->aSvpt[iSvpt];
+    int i;
+    for(i=0; i<pSet->nAlloc; i++){
+      RowLockEntry **pp = &pSet->aHash[i];
+      while( *pp ){
+        RowLockEntry *pEntry = *pp;
+        if( pEntry->iGen >= iGen ){
+          *pp = pEntry->pNext;
+          sqlite3_free(pEntry->pKey);
+          sqlite3_free(pEntry);
+          pSet->nEntry--;
+        }else{
+          pp = &pEntry->pNext;
+        }
+      }
+    }
+    pSet->nSvpt    = iSvpt + 1;  /* savepoint iSvpt remains open */
+    pSet->iGenCur  = iGen;        /* new entries after rollback get same gen */
+    pSet->bSpilled = 0;           /* re-enable row tracking after rollback */
+  }else{
+    /* RELEASE — entries from savepoint are adopted by parent scope */
+    pSet->nSvpt = iSvpt;
+  }
+}
+
+/*
+** Check whether commit row set pCommit conflicts with local row set pMine.
+**
+** pCommit contains the rows written by another transaction that committed
+** after our snapshot point.  pMine contains the rows we have read (or
+** written) in our transaction.
+**
+** Return values:
+**   1  - conflict detected (SQLITE_BUSY_SNAPSHOT should be returned)
+**   0  - no conflict
+**  -1  - unknown (either set is spilled, or row-level info is insufficient;
+**         fall back to page-level check)
+**
+** BLOBKEY entries in pCommit:
+**   If pMine has NO entries for the same iRoot, we cannot determine the
+**   conflict at row level (T1 may have read the page without tracking
+**   individual keys). Return -1 to fall back to page-level.
+**   If pMine DOES have entries for that iRoot, an exact key-blob match
+**   is a conflict; no match means no conflict for that entry.
+*/
+int rowLockSetHasConflict(
+  const RowLockSet *pCommit,  /* Row locks from the committing transaction */
+  const RowLockSet *pMine,    /* Row locks held by our read transaction */
+  int bReadCommitted          /* Non-zero if read-committed isolation is active */
+){
+  int i;
+  if( pCommit==0 || pMine==0 ) return -1;
+  if( pCommit->bSpilled || pMine->bSpilled ) return -1;
+
+  /* Walk every WRITE entry in pCommit and look it up in pMine */
+  for(i=0; i<pCommit->nAlloc; i++){
+    const RowLockEntry *pC;
+    for(pC=pCommit->aHash[i]; pC; pC=pC->pNext){
+      const RowLockEntry *pM;
+      if( pC->eType!=ROW_LOCK_WRITE ) continue;
+
+      if( pC->pKey ){
+        /* BLOBKEY entry: compare by PK fields (nKeyField) only.
+        ** First check whether pMine has ANY entry for this root.
+        ** If not, we have insufficient row-level information for this
+        ** index (T1 may have read it via pAllRead without recording keys),
+        ** so fall back to page-level. */
+        int bMineHasRoot = 0;
+        int j;
+        unsigned int h;
+        for(j=0; j<pMine->nAlloc && !bMineHasRoot; j++){
+          for(pM=pMine->aHash[j]; pM; pM=pM->pNext){
+            if( pM->iRoot==pC->iRoot ){
+              bMineHasRoot = 1;
+              break;
+            }
+          }
+        }
+        if( !bMineHasRoot ) return -1;  /* fall back to page-level */
+
+        /* pMine has entries for this root: look up by PK fields */
+        h = rowLockBlobHashKF(pC->iRoot, pC->pKey, pC->nKey,
+                              pC->nKeyField, pMine->nAlloc);
+        for(pM=pMine->aHash[h]; pM; pM=pM->pNext){
+          if( pM->iRoot==pC->iRoot && pM->pKey!=0 ){
+            int cmp = btreeRawRecordCmp(pM->pKey, pM->nKey,
+                                        pC->pKey, pC->nKey,
+                                        pC->nKeyField);
+            if( cmp!=0 ) continue;
+            if( bReadCommitted && pM->eType==ROW_LOCK_READ ) continue;
+            return 1;  /* conflict */
+          }
+        }
+      }else{
+        /* INTKEY entry: hash on (iRoot, iRowid) */
+        unsigned int h = (unsigned int)(
+            ((u64)pC->iRoot*2654435761ULL ^ (u64)(u32)pC->iRowid)
+            % (unsigned int)pMine->nAlloc);
+        for(pM=pMine->aHash[h]; pM; pM=pM->pNext){
+          if( pM->iRoot==pC->iRoot && pM->pKey==0
+           && pM->iRowid==pC->iRowid ){
+            /* In read-committed mode a read-read-after-write is not a conflict */
+            if( bReadCommitted && pM->eType==ROW_LOCK_READ ) continue;
+            return 1; /* conflict */
+          }
+        }
+      }
+    }
+  }
+  return 0; /* no conflict */
+}
+
+/*
+** Return the sqlite3 database connection associated with a RowLockSet.
+** Used by wal.c which treats RowLockSet as an opaque pointer.
+*/
+sqlite3 *rowLockSetGetDb(RowLockSet *pSet){
+  return pSet ? pSet->db : 0;
+}
+
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
 static void releasePage(MemPage *pPage);  /* Forward reference */
 static void releasePageOne(MemPage *pPage);      /* Forward reference */
 static void releasePageNotNull(MemPage *pPage);  /* Forward reference */
@@ -4040,6 +4716,27 @@ trans_begun:
     if( rc==SQLITE_OK && wrflag ){
       rc = btreePtrmapAllocate(pBt);
     }
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING)
+    /* Allocate pRowLocks eagerly for all CONCURRENT transactions, not just
+    ** write-mode ones.  This ensures sqlite3BtreeIntegerKey() can record
+    ** ROW_LOCK_READ entries from the very first SELECT, before any write. */
+    if( rc==SQLITE_OK
+     && (p->db->flags & SQLITE_RowLevelLocking)!=0
+    ){
+      if( pBt->pRowLocks==0 ){
+        pBt->pRowLocks = rowLockSetNew(p->db);
+        if( pBt->pRowLocks==0 ) rc = SQLITE_NOMEM;
+      }
+    }
+#endif
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+    /* Propagate read-committed flag to the WAL layer so that page-level
+    ** conflict detection can skip read-only pages.  This works with or
+    ** without SQLITE_ENABLE_ROW_LEVEL_LOCKING. */
+    if( rc==SQLITE_OK && (p->db->flags & SQLITE_ReadCommitted)!=0 ){
+      sqlite3PagerSetReadCommitted(pBt->pPager, 1);
+    }
+#endif
   }
 #endif
 
@@ -4764,6 +5461,14 @@ static int btreeFixUnlocked(Btree *p){
 ** Once this is routine has returned, the only thing required to commit
 ** the write-transaction for this database file is to delete the journal.
 */
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/* Forward declarations — implementations follow insertCellFast() below */
+static int btreeFindCellByRowid(MemPage*, i64, int*);
+static int btreeMergeOnePage(BtShared*, MemPage*, const u8*, const RowLockSet*);
+static int btreeMergeConflictPages(Btree*);
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
 int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
   int rc = SQLITE_OK;
   if( p->inTrans==TRANS_WRITE ){
@@ -4789,6 +5494,15 @@ int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
     if( rc==SQLITE_OK && ISCONCURRENT && p->db->eConcurrent==CONCURRENT_OPEN ){
       rc = btreeFixUnlocked(p);
     }
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    /* Apply 3-way page merges for pages where RLL allowed both concurrent
+    ** transactions to write different rows to the same B-tree leaf page.
+    ** This must run AFTER walLockForCommit (which populates the merge list)
+    ** and BEFORE sqlite3PagerCommitPhaseOne (which writes pages to WAL). */
+    if( rc==SQLITE_OK && pBt->pRowLocks ){
+      rc = btreeMergeConflictPages(p);
+    }
+#endif
     if( rc==SQLITE_OK ){
       rc = sqlite3PagerCommitPhaseOne(pBt->pPager, zSuperJrnl, 0);
     }
@@ -4851,6 +5565,13 @@ static void btreeEndTransaction(Btree *p){
   ** Also call PagerEndConcurrent() to ensure that the pager has discarded
   ** the record of all pages read within the transaction.  */
   btreePtrmapDelete(pBt);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  rowLockSetFree(pBt->pRowLocks);
+  pBt->pRowLocks = 0;
+#endif
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+  sqlite3PagerSetReadCommitted(pBt->pPager, 0);
+#endif
   sqlite3PagerEndConcurrent(pBt->pPager);
   btreeIntegrity(p);
 }
@@ -4902,6 +5623,12 @@ int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
     }
     p->iBDataVersion--;  /* Compensate for pPager->iDataVersion++; */
     pBt->inTransaction = TRANS_READ;
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    /* Row-set ownership was transferred to the shared WalRowLog inside
+    ** pager_end_transaction() (called by sqlite3PagerCommitPhaseTwo above),
+    ** before the WAL write lock was released.  Just clear our pointer. */
+    pBt->pRowLocks = 0;
+#endif
     btreeClearHasContent(pBt);
   }
 
@@ -5084,6 +5811,11 @@ int sqlite3BtreeBeginStmt(Btree *p, int iStatement){
   if( rc==SQLITE_OK ){
     rc = btreePtrmapBegin(pBt, iStatement);
   }
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  if( rc==SQLITE_OK ){
+    rc = rowLockSetBegin(pBt->pRowLocks, iStatement);
+  }
+#endif
   sqlite3BtreeLeave(p);
   return rc;
 }
@@ -5104,10 +5836,25 @@ int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
   int rc = SQLITE_OK;
   if( p && p->inTrans==TRANS_WRITE ){
     BtShared *pBt = p->pBt;
-    assert( op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
+    assert( op==SAVEPOINT_BEGIN || op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
     assert( iSavepoint>=0 || (iSavepoint==-1 && op==SAVEPOINT_ROLLBACK) );
     sqlite3BtreeEnter(p);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    if( op==SAVEPOINT_BEGIN ){
+      /* Record a generation boundary so that ROLLBACK TO this savepoint can
+      ** remove only the entries added inside it.  iSavepoint is the 0-based
+      ** user-savepoint index; rowLockSetBegin uses 1-based levels. */
+      if( pBt->pRowLocks ){
+        rc = rowLockSetBegin(pBt->pRowLocks, iSavepoint);
+      }
+      sqlite3BtreeLeave(p);
+      return rc;
+    }
+#endif
     btreePtrmapEnd(pBt, op, iSavepoint);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    rowLockSetEnd(pBt->pRowLocks, op, iSavepoint);
+#endif
     if( op==SAVEPOINT_ROLLBACK ){
       rc = saveAllCursors(pBt, 0, 0);
     }
@@ -5335,6 +6082,16 @@ int sqlite3BtreeCloseCursor(BtCursor *pCur){
     unlockBtreeIfUnused(pBt);
     sqlite3_free(pCur->aOverflow);
     sqlite3_free(pCur->pKey);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    /* Phase 10.2: When the row-lock set has spilled to page-level, its entries
+    ** are dead weight — conflict detection ignores them (returns -1) and new
+    ** entries are not added.  Purge them now rather than holding them until
+    ** transaction end.  The set struct itself is kept alive so it can be
+    ** transferred to the WAL commit log on commit. */
+    if( pBt->pRowLocks && pBt->pRowLocks->bSpilled ){
+      rowLockSetPurgeEntries(pBt->pRowLocks);
+    }
+#endif
     if( (pBt->openFlags & BTREE_SINGLE) && pBt->pCursor==0 ){
       /* Since the BtShared is not sharable, there is no need to
       ** worry about the missing sqlite3BtreeLeave() call here.  */
@@ -5409,6 +6166,20 @@ i64 sqlite3BtreeIntegerKey(BtCursor *pCur){
   assert( pCur->eState==CURSOR_VALID );
   assert( pCur->curIntKey );
   getCellInfo(pCur);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  if( pCur->pBt->pRowLocks ){
+    /* P1 optimization: Skip ROW_LOCK_READ tracking for Read Committed mode.
+    ** RC mode ignores read-write conflicts, so read tracking is wasted work.
+    */
+#if defined(SQLITE_ENABLE_READ_ISOLATION)
+    if( (pCur->pBtree->db->flags & SQLITE_ReadCommitted)==0 )
+#endif
+    {
+      rowLockSetInsert(pCur->pBt->pRowLocks,
+          pCur->pgnoRoot, pCur->info.nKey, ROW_LOCK_READ);
+    }
+  }
+#endif
   return pCur->info.nKey;
 }
 
@@ -7992,6 +8763,496 @@ static int insertCellFast(
   return SQLITE_OK;
 }
 
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Binary-search an INTKEY leaf MemPage for a cell with key iRowid.
+** Returns the 0-based cell index if found, or -1 if not found.
+** Always sets *piInsertIdx to the position at which iRowid should be
+** inserted to maintain sorted order (equals cell index when found).
+*/
+static int btreeFindCellByRowid(MemPage *pPage, i64 iRowid, int *piInsertIdx){
+  int lwr = 0;
+  int upr = pPage->nCell - 1;
+  while( lwr <= upr ){
+    int mid = (lwr + upr) / 2;
+    u8 *pCell = findCell(pPage, mid);
+    CellInfo info;
+    pPage->xParseCell(pPage, pCell, &info);
+    if( info.nKey == iRowid ){
+      if( piInsertIdx ) *piInsertIdx = mid;
+      return mid;
+    } else if( info.nKey < iRowid ){
+      lwr = mid + 1;
+    } else {
+      upr = mid - 1;
+    }
+  }
+  if( piInsertIdx ) *piInsertIdx = lwr;
+  return -1;
+}
+
+/*
+** Decode a SQLite serial-type integer value. Returns the integer value
+** encoded at aData[] according to serial_type (1..6, 8, or 9).
+** Type 7 (float) and types 0, 10, 11, 12+ are not handled here.
+*/
+static i64 btreeDecodeSerialInt(u32 serial_type, const u8 *aData){
+  switch( serial_type ){
+    case 1: return (i8)aData[0];
+    case 2: return (((i64)(i8)aData[0])<<8) | aData[1];
+    case 3: return (((i64)(i8)aData[0])<<16) | ((i64)aData[1]<<8) | aData[2];
+    case 4: {
+      u32 y = ((u32)aData[0]<<24) | ((u32)aData[1]<<16)
+            | ((u32)aData[2]<<8)  | aData[3];
+      return (i64)(int)y;
+    }
+    case 5: {
+      i64 hi = (((i64)(i8)aData[0])<<8) | aData[1];
+      u32 lo = ((u32)aData[2]<<24) | ((u32)aData[3]<<16)
+             | ((u32)aData[4]<<8)  | aData[5];
+      return (hi<<32) | lo;
+    }
+    case 6: {
+      u64 x = ((u64)aData[0]<<56) | ((u64)aData[1]<<48)
+            | ((u64)aData[2]<<40) | ((u64)aData[3]<<32)
+            | ((u64)aData[4]<<24) | ((u64)aData[5]<<16)
+            | ((u64)aData[6]<<8)  | aData[7];
+      return (i64)x;
+    }
+    case 8: return 0;
+    case 9: return 1;
+    default: return 0;
+  }
+}
+
+/*
+** Compare two serialized SQLite index records without a KeyInfo.
+** Handles NULL (type 0), INTEGER (types 1-9 except 7), TEXT (type>=13,odd),
+** and BLOB (type>=12,even) field types, with NULL < INTEGER < TEXT < BLOB.
+** Returns negative / 0 / positive like memcmp.
+** Does NOT handle REAL (type 7) or collation sequences; returns 0 for those.
+** For the merge use case (standard index rows with TEXT + integer rowid),
+** this is sufficient and correct.
+** If nMaxField > 0, compare at most nMaxField fields; remaining fields are
+** treated as equal.  Use 0 (or a large value) to compare all fields.
+*/
+static int btreeRawRecordCmp(
+  const u8 *a, int na,
+  const u8 *b, int nb,
+  int nMaxField
+){
+  u32 szHdrA, szHdrB;
+  u32 idxA, idxB;    /* current position in header */
+  u32 dA, dB;        /* current position in data area */
+  int nField = 0;
+
+  if( na<1 || nb<1 ) return na - nb;
+
+  /* Parse header lengths */
+  if( a[0]<0x80 ){
+    szHdrA = a[0]; idxA = 1;
+  } else {
+    idxA = sqlite3GetVarint32(a, &szHdrA);
+  }
+  if( b[0]<0x80 ){
+    szHdrB = b[0]; idxB = 1;
+  } else {
+    idxB = sqlite3GetVarint32(b, &szHdrB);
+  }
+  dA = szHdrA;
+  dB = szHdrB;
+
+  while( idxA<szHdrA && idxB<szHdrB ){
+    u32 stA, stB;
+    int clA, clB;
+    u32 lenA, lenB;
+    int rc;
+
+    if( nMaxField>0 && nField>=nMaxField ) break;
+    nField++;
+
+    /* Read next serial type from each header */
+    if( a[idxA]<0x80 ){
+      stA = a[idxA]; idxA++;
+    } else {
+      idxA += sqlite3GetVarint32(&a[idxA], &stA);
+    }
+    if( b[idxB]<0x80 ){
+      stB = b[idxB]; idxB++;
+    } else {
+      idxB += sqlite3GetVarint32(&b[idxB], &stB);
+    }
+
+    /* Determine type classes: 0=null,1=int,2=float,3=text,4=blob */
+    clA = (stA==0)?0 : (stA<=6 || stA==8 || stA==9)?1 :
+          (stA==7)?2 : (stA&1)?3 : 4;
+    clB = (stB==0)?0 : (stB<=6 || stB==8 || stB==9)?1 :
+          (stB==7)?2 : (stB&1)?3 : 4;
+
+    if( clA != clB ){
+      return clA < clB ? -1 : 1;
+    }
+
+    lenA = sqlite3VdbeSerialTypeLen(stA);
+    lenB = sqlite3VdbeSerialTypeLen(stB);
+
+    rc = 0;
+    if( clA==0 ){
+      /* both NULL → equal */
+    } else if( clA==1 ){
+      /* both INTEGER */
+      i64 iA = btreeDecodeSerialInt(stA, a+dA);
+      i64 iB = btreeDecodeSerialInt(stB, b+dB);
+      rc = (iA<iB) ? -1 : (iA>iB) ? 1 : 0;
+    } else if( clA==3 || clA==4 ){
+      /* TEXT or BLOB: compare bytes then length */
+      int nA2 = (int)lenA, nB2 = (int)lenB;
+      int n = nA2 < nB2 ? nA2 : nB2;
+      if( (u32)(dA+n) <= (u32)na && (u32)(dB+n) <= (u32)nb ){
+        rc = memcmp(a+dA, b+dB, n);
+      }
+      if( rc==0 ) rc = nA2 - nB2;
+    }
+    /* clA==2 (FLOAT): skip, treat as equal */
+
+    if( rc ) return rc;
+    dA += lenA;
+    dB += lenB;
+  }
+  /* If nMaxField limit reached, records are equal in the PK fields */
+  if( nMaxField>0 && nField>=nMaxField ) return 0;
+  /* If one record has more fields, the shorter one is "less" */
+  return (idxA<szHdrA) ? 1 : (idxB<szHdrB) ? -1 : 0;
+}
+
+/*
+** Linear-scan a BLOBKEY leaf MemPage for a cell whose key matches
+** pKey[0..nKey-1] in its first nKeyField fields (or all fields if nKeyField==0).
+** Returns the 0-based cell index if found, or -1 if not found.
+** Sets *piInsertIdx to the insert position (index of first cell with a
+** key strictly greater than pKey per btreeRawRecordCmp, or pPage->nCell
+** if all keys are <=).
+**
+** Cells with overflow keys (info.nLocal < info.nKey) cannot be matched
+** exactly from their page bytes alone; those cells are skipped for matching
+** but are still used to determine ordering (via their available local bytes).
+*/
+static int btreeFindCellByBlob(
+  MemPage *pPage,
+  const u8 *pKey,
+  int nKey,
+  int nKeyField,
+  int *piInsertIdx
+){
+  int i;
+  int insIdx = pPage->nCell;
+
+  for(i=0; i<pPage->nCell; i++){
+    u8 *pCell = findCell(pPage, i);
+    CellInfo info;
+    int c;
+
+    pPage->xParseCell(pPage, pCell, &info);
+    if( (i64)info.nKey <= 0 ) continue;
+
+    if( info.nLocal == info.nKey ){
+      /* All key bytes are local — we can do exact match and ordering.
+      ** For nKeyField>0 (WITHOUT ROWID), compare only the PK fields;
+      ** for nKeyField==0 (regular index), compare all fields. */
+      c = btreeRawRecordCmp(info.pPayload, (int)info.nKey, pKey, nKey,
+                            nKeyField);
+      if( c == 0 ){
+        /* Exact PK match */
+        if( piInsertIdx ) *piInsertIdx = i;
+        return i;
+      }
+      if( c > 0 && insIdx == pPage->nCell ){
+        insIdx = i;
+        /* Don't break — cells may not be in raw-byte order */
+      }
+    } else {
+      /* Overflow cell: compare available local bytes only for ordering */
+      int cmpLen = (int)info.nLocal < nKey ? (int)info.nLocal : nKey;
+      c = memcmp(info.pPayload, pKey, cmpLen);
+      if( c == 0 ){
+        /* Local bytes match — cannot determine equality; treat as < */
+        c = -1;
+      }
+      if( c > 0 && insIdx == pPage->nCell ){
+        insIdx = i;
+      }
+    }
+  }
+
+  if( piInsertIdx ) *piInsertIdx = insIdx;
+  return -1;  /* not found */
+}
+
+/*
+** Apply the concurrent (db2) transaction's row-level changes to db1's dirty
+** page pPage.  pConcurrent points to db2's committed page raw bytes (from
+** the WAL); pRows is db2's write set.
+**
+** For INTKEY leaf pages — for every ROW_LOCK_WRITE rowid R in pRows:
+**   - R in db2's page but not db1's → INSERT db2's cell into db1's page
+**   - R in both pages with different content → REPLACE db1's cell with db2's
+**   - R absent from db2's page → skip (deletion merging deferred)
+**
+** For BLOBKEY leaf pages — same logic using key-blob lookup.
+**
+** BLOBKEY cells whose key spans overflow pages are skipped (uncommon for
+** index keys; page-level conflict detection handles those conservatively).
+** Interior pages are skipped silently.
+** Returns SQLITE_OK on success, SQLITE_FULL if space is insufficient.
+*/
+static int btreeMergeOnePage(
+  BtShared *pBt,          /* BtShared (for pTmpSpace, pageSize) */
+  MemPage *pPage,         /* db1's dirty page to modify */
+  const u8 *pConcurrent,  /* read-only raw bytes of db2's committed page */
+  const RowLockSet *pRows /* db2's row write set */
+){
+  int rc = SQLITE_OK;
+  int i;
+  MemPage tempPage;       /* read-only MemPage over pConcurrent */
+  u8 *data;
+  int nSpaceNeeded = 0;   /* net extra bytes db1's page needs */
+
+  if( pRows==0 || pRows->bSpilled ) return SQLITE_OK;
+
+  /* Initialize a read-only MemPage over db2's raw page bytes,
+  ** replicating the relevant parts of btreeInitPage() without
+  ** requiring a valid pDbPage pointer. */
+  memset(&tempPage, 0, sizeof(MemPage));
+  tempPage.pBt = pBt;
+  tempPage.aData = (u8 *)pConcurrent;
+  tempPage.pgno = pPage->pgno;
+  tempPage.hdrOffset = pPage->hdrOffset;
+  data = tempPage.aData + tempPage.hdrOffset;
+  if( decodeFlags(&tempPage, data[0]) ){
+    return SQLITE_OK;   /* corrupt or unsupported page type; skip */
+  }
+  tempPage.maskPage = (u16)(pBt->pageSize - 1);
+  tempPage.nOverflow = 0;
+  tempPage.cellOffset = (u16)(tempPage.hdrOffset + 8 + tempPage.childPtrSize);
+  tempPage.aCellIdx = data + tempPage.childPtrSize + 8;
+  tempPage.aDataEnd = tempPage.aData + pBt->pageSize;
+  tempPage.aDataOfst = tempPage.aData + tempPage.childPtrSize;
+  tempPage.nCell = get2byte(&data[3]);
+  tempPage.nFree = -1;
+  tempPage.isInit = 1;
+
+  /* Skip interior pages and incompatible page type pairs */
+  if( !tempPage.leaf || !pPage->leaf ) return SQLITE_OK;
+  if( (int)tempPage.intKey != (int)pPage->intKey ) return SQLITE_OK;
+
+  /* BLOBKEY leaf page merge */
+  if( !tempPage.intKeyLeaf ){
+    /* Ensure db1's page has an up-to-date nFree */
+    if( pPage->nFree < 0 ){
+      rc = btreeComputeFreeSpace(pPage);
+      if( rc ) return rc;
+    }
+
+    /* --- First pass: compute net space needed --- */
+    for(i=0; i<pRows->nAlloc; i++){
+      const RowLockEntry *e;
+      for(e=pRows->aHash[i]; e; e=e->pNext){
+        int idx2, idx1;
+        u8 *pCell2;
+        int sz2;
+        if( e->eType!=ROW_LOCK_WRITE || e->pKey==0 ) continue;
+        /* Find e->pKey in T2's committed page (full-record match, nKeyField=0) */
+        idx2 = btreeFindCellByBlob(&tempPage, e->pKey, e->nKey, 0, NULL);
+        if( idx2 < 0 ) continue;  /* T2 deleted or overflow — skip */
+        pCell2 = findCell(&tempPage, idx2);
+        sz2 = (int)tempPage.xCellSize(&tempPage, pCell2);
+        /* Find matching PK in T1's page (PK-field match only) */
+        idx1 = btreeFindCellByBlob(pPage, e->pKey, e->nKey, e->nKeyField, NULL);
+        if( idx1 < 0 ){
+          nSpaceNeeded += sz2 + 2;   /* new cell + pointer */
+        } else {
+          u8 *pCell1 = findCell(pPage, idx1);
+          int sz1 = (int)pPage->xCellSize(pPage, pCell1);
+          if( sz1!=sz2 || memcmp(pCell1, pCell2, sz2)!=0 ){
+            nSpaceNeeded += sz2 - sz1;  /* net change (may be negative) */
+          }
+        }
+      }
+    }
+    if( nSpaceNeeded > pPage->nFree ){
+      return SQLITE_FULL;  /* not enough space; caller should refuse commit */
+    }
+
+    /* --- Second pass: apply db2's changes to db1's page --- */
+    for(i=0; i<pRows->nAlloc; i++){
+      const RowLockEntry *e;
+      for(e=pRows->aHash[i]; e; e=e->pNext){
+        int idx2, idx1, insIdx1;
+        u8 *pCell2;
+        int sz2;
+        if( e->eType!=ROW_LOCK_WRITE || e->pKey==0 ) continue;
+        /* Find e->pKey in T2's committed page (full-record match, nKeyField=0) */
+        idx2 = btreeFindCellByBlob(&tempPage, e->pKey, e->nKey, 0, NULL);
+        if( idx2 < 0 ) continue;   /* T2 deleted or overflow — skip */
+        pCell2 = findCell(&tempPage, idx2);
+        sz2 = (int)tempPage.xCellSize(&tempPage, pCell2);
+        /* Re-find matching PK in db1's page (PK-field match only) */
+        idx1 = btreeFindCellByBlob(pPage, e->pKey, e->nKey, e->nKeyField,
+                                   &insIdx1);
+        if( idx1 >= 0 ){
+          u8 *pCell1 = findCell(pPage, idx1);
+          int sz1 = (int)pPage->xCellSize(pPage, pCell1);
+          if( sz1==sz2 && memcmp(pCell1, pCell2, sz2)==0 ) continue;
+          /* Different content: drop db1's version, then insert db2's */
+          dropCell(pPage, idx1, sz1, &rc);
+          if( rc ) return rc;
+          /* Re-find insert position after drop */
+          btreeFindCellByBlob(pPage, e->pKey, e->nKey, e->nKeyField, &insIdx1);
+        }
+        {
+          u8 *pTmp = pBt->pTmpSpace;
+          assert( sz2 <= (int)pBt->pageSize );
+          memcpy(pTmp, pCell2, sz2);
+          rc = insertCellFast(pPage, insIdx1, pTmp, sz2);
+          if( rc ) return rc;
+          assert( pPage->nOverflow==0 ); /* guaranteed by space check above */
+        }
+      }
+    }
+    return SQLITE_OK;
+  }
+
+  /* INTKEY leaf page merge (original code) */
+  /* Ensure db1's page has an up-to-date nFree */
+  if( pPage->nFree < 0 ){
+    rc = btreeComputeFreeSpace(pPage);
+    if( rc ) return rc;
+  }
+
+  /* --- First pass: compute net space needed --- */
+  for(i=0; i<pRows->nAlloc; i++){
+    const RowLockEntry *e;
+    for(e=pRows->aHash[i]; e; e=e->pNext){
+      int idx2, idx1;
+      u8 *pCell2;
+      int sz2;
+      if( e->eType!=ROW_LOCK_WRITE || e->pKey!=0 ) continue;
+      idx2 = btreeFindCellByRowid(&tempPage, e->iRowid, NULL);
+      if( idx2 < 0 ) continue;
+      pCell2 = findCell(&tempPage, idx2);
+      sz2 = (int)tempPage.xCellSize(&tempPage, pCell2);
+      idx1 = btreeFindCellByRowid(pPage, e->iRowid, NULL);
+      if( idx1 < 0 ){
+        nSpaceNeeded += sz2 + 2;   /* new cell + pointer */
+      } else {
+        u8 *pCell1 = findCell(pPage, idx1);
+        int sz1 = (int)pPage->xCellSize(pPage, pCell1);
+        if( sz1!=sz2 || memcmp(pCell1, pCell2, sz2)!=0 ){
+          nSpaceNeeded += sz2 - sz1;  /* net change (may be negative) */
+        }
+      }
+    }
+  }
+  if( nSpaceNeeded > pPage->nFree ){
+    return SQLITE_FULL;  /* not enough space; caller should refuse commit */
+  }
+
+  /* --- Second pass: apply db2's changes to db1's page --- */
+  for(i=0; i<pRows->nAlloc; i++){
+    const RowLockEntry *e;
+    for(e=pRows->aHash[i]; e; e=e->pNext){
+      int idx2, idx1, insIdx1;
+      u8 *pCell2;
+      int sz2;
+      if( e->eType!=ROW_LOCK_WRITE || e->pKey!=0 ) continue;
+      idx2 = btreeFindCellByRowid(&tempPage, e->iRowid, NULL);
+      if( idx2 < 0 ) continue;
+      pCell2 = findCell(&tempPage, idx2);
+      sz2 = (int)tempPage.xCellSize(&tempPage, pCell2);
+      /* Re-find in db1's page (indices shift after prior modifications) */
+      idx1 = btreeFindCellByRowid(pPage, e->iRowid, &insIdx1);
+      if( idx1 >= 0 ){
+        u8 *pCell1 = findCell(pPage, idx1);
+        int sz1 = (int)pPage->xCellSize(pPage, pCell1);
+        if( sz1==sz2 && memcmp(pCell1, pCell2, sz2)==0 ) continue;
+        /* Different content: drop db1's version, then insert db2's */
+        dropCell(pPage, idx1, sz1, &rc);
+        if( rc ) return rc;
+        btreeFindCellByRowid(pPage, e->iRowid, &insIdx1);
+      }
+      {
+        u8 *pTmp = pBt->pTmpSpace;
+        assert( sz2 <= (int)pBt->pageSize );
+        memcpy(pTmp, pCell2, sz2);
+        rc = insertCellFast(pPage, insIdx1, pTmp, sz2);
+        if( rc ) return rc;
+        assert( pPage->nOverflow==0 ); /* guaranteed by space check above */
+      }
+    }
+  }
+  return SQLITE_OK;
+}
+
+/*
+** After walLockForCommit() has populated pWal->pMergePages with pages that
+** need 3-way merging (RLL detected bRowConflict=0 but both concurrent
+** transactions dirtied the same page), this function performs those merges
+** in place on db1's dirty pages.
+**
+** Must be called after sqlite3BtreeExclusiveLock() and before
+** sqlite3PagerCommitPhaseOne().
+*/
+static int btreeMergeConflictPages(Btree *p){
+  int rc = SQLITE_OK;
+  BtShared *pBt = p->pBt;
+  Wal *pWal;
+  struct WalMergePage *pM;
+  u8 *aBuf;
+
+  pWal = sqlite3PagerGetWal(pBt->pPager);
+  if( pWal==0 ) return SQLITE_OK;
+  pM = sqlite3WalGetMergePages(pWal);
+  if( pM==0 ) return SQLITE_OK;
+
+  aBuf = (u8 *)sqlite3Malloc(pBt->pageSize);
+  if( aBuf==0 ) return SQLITE_NOMEM;
+
+  for( ; pM && rc==SQLITE_OK; pM=pM->pNext ){
+    PgHdr *pPg;
+    MemPage *pPage;
+    if( pM->pRows==0 ) continue;
+    pPg = sqlite3PagerLookup(pBt->pPager, pM->pgno);
+    if( pPg==0 ) continue;
+    if( !sqlite3PagerIswriteable(pPg) ){
+      sqlite3PagerUnref(pPg);
+      continue;
+    }
+    rc = sqlite3WalReadFrame(pWal, pM->iFrame, (int)pBt->pageSize, aBuf);
+    if( rc!=SQLITE_OK ){
+      sqlite3PagerUnref(pPg);
+      break;
+    }
+    pPage = (MemPage *)sqlite3PagerGetExtra(pPg);
+    if( pPage && pPage->isInit==0 ){
+      btreePageFromDbPage(pPg, pM->pgno, pBt);
+      rc = btreeInitPage(pPage);
+      if( rc!=SQLITE_OK ){
+        sqlite3PagerUnref(pPg);
+        break;
+      }
+    }
+    if( pPage && pPage->isInit ){
+      rc = btreeMergeOnePage(pBt, pPage, aBuf, pM->pRows);
+    }
+    sqlite3PagerUnref(pPg);
+  }
+
+  sqlite3_free(aBuf);
+  sqlite3WalClearMergePages(pWal);
+  return rc;
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
 /*
 ** The following parameters determine how many adjacent pages get involved
 ** in a balancing operation.  NN is the number of neighbors on either side
@@ -9969,6 +11230,12 @@ int sqlite3BtreeInsert(
 
   if( pCur->pKeyInfo==0 ){
     assert( pX->pKey==0 );
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    if( pCur->pBt->pRowLocks ){
+      rowLockSetInsert(pCur->pBt->pRowLocks,
+          pCur->pgnoRoot, pX->nKey, ROW_LOCK_WRITE);
+    }
+#endif
     /* If this is an insert into a table b-tree, invalidate any incrblob
     ** cursors open on the row being replaced */
     if( p->hasIncrblobCur ){
@@ -10012,6 +11279,13 @@ int sqlite3BtreeInsert(
     }
   }else{
     /* This is an index or a WITHOUT ROWID table */
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    if( pCur->pBt->pRowLocks && pX->pKey && pX->nKey>0 ){
+      int nKF = pCur->pKeyInfo ? (int)pCur->pKeyInfo->nKeyField : 0;
+      rowLockSetInsertBlob(pCur->pBt->pRowLocks,
+          pCur->pgnoRoot, pX->pKey, (int)pX->nKey, nKF, ROW_LOCK_WRITE);
+    }
+#endif
 
     /* If BTREE_SAVEPOSITION is set, the cursor must already be pointing
     ** to a row with the same key as the new entry being inserted.
@@ -10366,6 +11640,38 @@ int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
     }
   }
   assert( pCur->eState==CURSOR_VALID );
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  if( pCur->pBt->pRowLocks ){
+    getCellInfo(pCur);
+    if( pCur->pPage->intKey ){
+      rowLockSetInsert(pCur->pBt->pRowLocks,
+          pCur->pgnoRoot, pCur->info.nKey, ROW_LOCK_WRITE);
+    }else{
+      /* BLOBKEY (index / WITHOUT ROWID) delete: track the key blob. */
+      int nKeyBlob = (int)pCur->info.nKey;
+      int nKF = pCur->pKeyInfo ? (int)pCur->pKeyInfo->nKeyField : 0;
+      if( nKeyBlob>0 ){
+        if( pCur->info.nLocal==(u32)nKeyBlob ){
+          /* All key bytes are local on the page — use them directly. */
+          rowLockSetInsertBlob(pCur->pBt->pRowLocks,
+              pCur->pgnoRoot, pCur->info.pPayload, nKeyBlob, nKF,
+              ROW_LOCK_WRITE);
+        }else{
+          /* Key spans overflow pages — fetch the full key into a buffer. */
+          u8 *pKeyBuf = (u8*)sqlite3Malloc(nKeyBlob);
+          if( pKeyBuf ){
+            if( sqlite3BtreePayload(pCur, 0, nKeyBlob, pKeyBuf)==SQLITE_OK ){
+              rowLockSetInsertBlob(pCur->pBt->pRowLocks,
+                  pCur->pgnoRoot, pKeyBuf, nKeyBlob, nKF, ROW_LOCK_WRITE);
+            }
+            sqlite3_free(pKeyBuf);
+          }
+        }
+      }
+    }
+  }
+#endif
 
   iCellDepth = pCur->iPage;
   iCellIdx = pCur->ix;
@@ -12083,6 +13389,11 @@ int sqlite3BtreeExclusiveLock(Btree *p){
   assert( p->inTrans==TRANS_WRITE && pBt->pPage1 );
   memset(db->aCommit, 0, sizeof(db->aCommit));
   sqlite3BtreeEnter(p);
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  if( pBt->pRowLocks ){
+    sqlite3PagerSetReadRowSet(pBt->pPager, pBt->pRowLocks);
+  }
+#endif
   rc = sqlite3PagerExclusiveLock(pBt->pPager, 
     (db->eConcurrent==CONCURRENT_SCHEMA) ? 0 : pBt->pPage1->pDbPage,
     db->aCommit
@@ -12224,3 +13535,17 @@ int sqlite3_commit_status(
 #endif
   return rc;
 }
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Return the number of WalCommitRowSet entries in the WAL row log for the
+** given b-tree handle.  Used by SQLITE_TESTCTRL_WAL_ROWLOG_COUNT.
+*/
+int sqlite3BtreeRowLogCount(Btree *p){
+  int n;
+  sqlite3BtreeEnter(p);
+  n = sqlite3PagerRowLogCount(p->pBt->pPager);
+  sqlite3BtreeLeave(p);
+  return n;
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */

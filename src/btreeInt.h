@@ -214,6 +214,7 @@
 **      *     zero or more pages numbers of leaves
 */
 #include "sqliteInt.h"
+#include "wal.h"
 
 
 /* The following value is the maximum cell size assuming a maximum page
@@ -432,6 +433,44 @@ struct Btree {
 **
 **   This feature is included to help prevent writer-starvation.
 */
+
+/*
+** Row-level locking structures used when SQLITE_ENABLE_ROW_LEVEL_LOCKING
+** is defined.  A RowLockSet tracks which (table/index, key) pairs have been
+** read or written during a CONCURRENT transaction.  Applies to both
+** INTKEY (ordinary rowid) b-trees and BLOBKEY (index / WITHOUT ROWID) b-trees.
+**
+** For INTKEY entries: pKey==NULL, iRowid holds the integer key.
+** For BLOBKEY entries: pKey points to the serialised key blob, nKey is its
+** byte length, and iRowid is unused (0).
+*/
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+#define ROW_LOCK_READ   1   /* Row was read */
+#define ROW_LOCK_WRITE  2   /* Row was written (insert/update/delete) */
+struct RowLockEntry {
+  Pgno          iRoot;      /* B-tree root page (tree identifier) */
+  i64           iRowid;     /* Integer key (INTKEY trees); 0 for BLOBKEY */
+  u8           *pKey;       /* Serialised key blob (BLOBKEY trees); NULL for INTKEY */
+  int           nKey;       /* Byte length of pKey; 0 for INTKEY entries */
+  int           nKeyField;  /* Number of PK/key fields for BLOBKEY comparison; 0=all */
+  u32           iGen;       /* Generation counter when this entry was added */
+  u8            eType;      /* ROW_LOCK_READ or ROW_LOCK_WRITE */
+  RowLockEntry *pNext;      /* Next entry in the same hash bucket */
+};
+struct RowLockSet {
+  RowLockEntry **aHash;     /* Array of hash buckets */
+  int            nAlloc;    /* Number of hash buckets allocated */
+  int            nEntry;    /* Total entries inserted */
+  int            nThreshold; /* Max entries before page-level fallback */
+  u8             bSpilled;  /* True: exceeded threshold, use page-level */
+  sqlite3       *db;        /* For sqlite3DbMalloc/Free */
+  u32            iGenCur;   /* Generation value stamped on new entries */
+  int            nSvpt;     /* Number of active savepoint levels */
+  int            nSvptAlloc;/* Allocated size of aSvpt[] */
+  u32           *aSvpt;     /* Generation at start of each savepoint level */
+};
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
 struct BtShared {
   Pager *pPager;        /* The page cache */
   sqlite3 *db;          /* Database connection currently using this Btree */
@@ -468,6 +507,9 @@ struct BtShared {
   u8 *pTmpSpace;        /* Temp space sufficient to hold a single cell */
 #ifndef SQLITE_OMIT_CONCURRENT
   BtreePtrmap *pMap;
+#endif
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  RowLockSet *pRowLocks;           /* Row-level lock/read set for CONCURRENT txns */
 #endif
   int nPreformatSize;   /* Size of last cell written by TransferRow() */
 };

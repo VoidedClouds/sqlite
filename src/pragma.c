@@ -2706,6 +2706,53 @@ void sqlite3Pragma(
     break;
   }
 
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  /*
+  **   PRAGMA row_lock_threshold
+  **   PRAGMA row_lock_threshold = N
+  **
+  ** Get or set the maximum number of row-lock entries tracked per transaction
+  ** before falling back to page-level conflict detection.
+  */
+  case PragTyp_ROW_LOCK_THRESHOLD: {
+    sqlite3_int64 N;
+    if( zRight
+     && sqlite3DecOrHexToI64(zRight, &N)==SQLITE_OK
+     && N>=0
+    ){
+      sqlite3_limit(db, SQLITE_LIMIT_ROW_LOCK_ENTRIES, (int)(N&0x7fffffff));
+    }
+    returnSingleInt(v, sqlite3_limit(db, SQLITE_LIMIT_ROW_LOCK_ENTRIES, -1));
+    break;
+  }
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+  /*
+  **   PRAGMA isolation_level
+  **   PRAGMA isolation_level = 'snapshot' | 'read_committed'
+  **
+  ** Get or set the isolation level for CONCURRENT transactions.
+  **
+  **   snapshot (default): A read-write conflict causes SQLITE_BUSY_SNAPSHOT.
+  **   read_committed:     Only write-write conflicts cause SQLITE_BUSY_SNAPSHOT.
+  **                       Stale reads are allowed; phantoms are possible.
+  */
+  case PragTyp_ISOLATION_LEVEL: {
+    if( zRight ){
+      if( sqlite3_stricmp(zRight, "read_committed")==0 ){
+        db->flags |= SQLITE_ReadCommitted;
+      }else{
+        /* 'snapshot' or any unrecognised value reverts to snapshot */
+        db->flags &= ~SQLITE_ReadCommitted;
+      }
+    }
+    returnSingleText(v,
+        (db->flags & SQLITE_ReadCommitted) ? "read_committed" : "snapshot");
+    break;
+  }
+#endif /* SQLITE_ENABLE_READ_ISOLATION && !SQLITE_OMIT_CONCURRENT */
+
   /*
   **   PRAGMA analysis_limit
   **   PRAGMA analysis_limit = N

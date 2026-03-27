@@ -1,0 +1,360 @@
+# 2026 March
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for the row-level locking sidecar (<db>-rowlog) file.
+#
+# The sidecar persists commit records to disk so that a later writer
+# (in a different process) can load row-level lock information left by
+# a prior process, enabling precise row-level conflict detection
+# across process boundaries and avoiding false SQLITE_BUSY_SNAPSHOT
+# conflicts caused by page-level WAL frame checks.
+#
+# Sections:
+#   1.x  Sidecar file lifecycle (create / persist / delete on checkpoint)
+#   2.x  Cross-process: non-overlapping rows — sidecar enables commit
+#   3.x  Cross-process: real row conflict still produces BUSY_SNAPSHOT
+#   4.x  Incremental sidecar load — db1 already committed once, db2 appends
+#   5.x  Generation reset — TRUNCATE checkpoint resets incremental state
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-sidecar
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_sidecar.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled - skipping"
+  finish_test
+  return
+}
+
+# Return the path of the sidecar file for the test database.
+proc sidecar_path {} {
+  return "[get_pwd]/test.db-rowlog"
+}
+
+#--------------------------------------------------------------------------
+# Section 1: Sidecar file lifecycle
+#--------------------------------------------------------------------------
+
+do_test 1.1 {
+  db eval {
+    PRAGMA journal_mode = wal;
+    PRAGMA row_level_locking = 1;
+    CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+  }
+  # A row-level locking CONCURRENT commit should create the sidecar.
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t1 VALUES(10, 'ten');
+    COMMIT;
+  }
+  file exists [sidecar_path]
+} {1}
+
+do_test 1.2 {
+  # The sidecar persists after the committing connection stays open.
+  file exists [sidecar_path]
+} {1}
+
+do_test 1.3 {
+  # A TRUNCATE checkpoint deletes the sidecar (WAL frames purged).
+  db eval { PRAGMA wal_checkpoint(TRUNCATE) }
+  file exists [sidecar_path]
+} {0}
+
+do_test 1.4 {
+  # Another RLL commit recreates the sidecar.
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t1 VALUES(11, 'eleven');
+    COMMIT;
+  }
+  file exists [sidecar_path]
+} {1}
+
+do_test 1.5 {
+  # Opening a second connection to the same DB does NOT delete the sidecar.
+  sqlite3 db2 [get_pwd]/test.db
+  file exists [sidecar_path]
+} {1}
+
+do_test 1.6 {
+  # The sidecar survives db2 closing.
+  db2 close
+  file exists [sidecar_path]
+} {1}
+
+do_test 1.7 {
+  # PASSIVE checkpoint does not delete the sidecar (only TRUNCATE does).
+  db eval { PRAGMA wal_checkpoint(PASSIVE) }
+  file exists [sidecar_path]
+} {1}
+
+do_test 1.8 {
+  # Full checkpoint with TRUNCATE deletes sidecar.
+  db eval { PRAGMA wal_checkpoint(TRUNCATE) }
+  file exists [sidecar_path]
+} {0}
+
+reset_db
+
+#--------------------------------------------------------------------------
+# Section 2: Cross-process non-conflict — sidecar enables commit
+#
+# db1 inserts rowid 10, db2 (cross-process for tn=1) inserts rowid 20.
+# Both rows land on the same b-tree page.  Without the sidecar, Process A
+# would see a page-level conflict and return SQLITE_BUSY_SNAPSHOT.  With
+# the sidecar, row 10 ≠ row 20 → no real conflict → SQLITE_OK.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t2(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t2 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 2.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t2 VALUES(10, 'db1-ten'); }
+  } {}
+
+  # db2 commits rowid 20 — different row, same page.
+  do_test 2.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t2 VALUES(20, 'db2-twenty'); COMMIT; }
+  } {}
+
+  # Both tn=1 (cross-process) and tn=2 (same-process): sidecar-aware conflict
+  # check resolves rowid 10 vs rowid 20 as non-overlapping — commit succeeds.
+  do_test 2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 2.$tn.4 {
+    sql1 { SELECT k FROM t2 ORDER BY k }
+  } {1 2 3 10 20}
+
+} ;# do_multiclient_test
+
+reset_db
+
+#--------------------------------------------------------------------------
+# Section 3: Cross-process real row conflict — sidecar still returns BUSY
+#
+# db1 writes rowid 10, db2 also writes rowid 10 and commits first.
+# The sidecar records rowid 10 for db2's commit.  When db1 tries to commit,
+# walSidecarLoad loads that record, and rowLockSetHasConflict reports an
+# overlap → SQLITE_BUSY_SNAPSHOT, same as same-process case.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t3(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t3 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 3.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t3 VALUES(10, 'db1-ten'); }
+  } {}
+
+  # db2 commits the SAME rowid 10 — real row conflict.
+  do_test 3.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t3 VALUES(10, 'db2-ten'); COMMIT; }
+  } {}
+
+  # Both tn=1 and tn=2: row 10 in both write sets → SQLITE_BUSY_SNAPSHOT.
+  do_test 3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    code1 { list $::rc [sqlite3_extended_errcode db] }
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  catch { sql1 ROLLBACK }
+
+} ;# do_multiclient_test
+
+reset_db
+
+#--------------------------------------------------------------------------
+# Section 4: Incremental sidecar load — db1 already committed once
+#
+# This exercises the incremental path in walSidecarLoad.
+#
+# The scenario:
+#   1. db1 makes its own initial commit (sets bSidecarLoaded on its pRowLog,
+#      iSidecarReadOff = file size at that point).
+#   2. db2 makes a commit writing rowid 20 (appends a NEW sidecar record
+#      AFTER iSidecarReadOff; db1 has not seen it yet).
+#   3. db1 starts a new BEGIN CONCURRENT and then commits writing rowid 30
+#      (different from 20, but on the same b-tree page).
+#
+# For tn=1 (cross-process): without the incremental load, db1 would fall
+# back to page-level conflict detection and return SQLITE_BUSY_SNAPSHOT
+# because rows 20 and 30 share a page.  With incremental load, db1 reads
+# the new sidecar record on its second commit, finds rowid 30 ≠ rowid 20,
+# and commits successfully.
+#
+# For tn=2 (same process): db2's commit adds to pCommits in-memory directly,
+# so the test passes with or without the sidecar; it remains a regression
+# guard.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 4.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t4(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t4 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # Step 1: db1 commits first, establishing bSidecarLoaded and iSidecarReadOff.
+  do_test 4.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t4 VALUES(100, 'db1-first'); COMMIT; }
+  } {}
+
+  # Step 2: db2 commits rowid 20 — appends a NEW sidecar record after
+  # db1's iSidecarReadOff.  In tn=1 this happens in a separate process.
+  do_test 4.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t4 VALUES(20, 'db2-twenty'); COMMIT; }
+  } {}
+
+  # Step 3: db1 starts a second CONCURRENT transaction and writes rowid 30.
+  do_test 4.$tn.3 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t4 VALUES(30, 'db1-thirty'); }
+  } {}
+
+  # db1 commits — rowid 30 ≠ rowid 20 so there is no row conflict.
+  # For tn=1: incremental sidecar load must pick up db2's record; without
+  # it this would return SQLITE_BUSY_SNAPSHOT (page-level false conflict).
+  do_test 4.$tn.4 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 4.$tn.5 {
+    sql1 { SELECT k FROM t4 ORDER BY k }
+  } {1 2 3 20 30 100}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 5: Generation reset after TRUNCATE checkpoint
+#
+# Sequence (same-process only — tn=1 in do_multiclient_test):
+#   db1 commits rowid 100  → bSidecarLoaded=1, iSidecarReadOff=X, sidecar exists
+#   db2 runs PRAGMA wal_checkpoint(TRUNCATE)
+#                          → WAL truncated, new salts written, sidecar deleted
+#   db1 commits rowid 200  → incremental path: open fails (file gone), reset
+#                            → bSidecarLoaded=0
+#   db1 commits rowid 300  → full-load path: sidecar absent (no new writer), OK
+#   db2 commits rowid 20   → new sidecar created for new generation
+#   db1 commits rowid 30   → full-load path reads new sidecar, rowid 30 ≠ 20 OK
+#
+# Key assertions:
+#   - None of the db1 commits after the checkpoint return an error
+#   - After the checkpoint the old sidecar is gone
+#   - After db2 commits, a new sidecar exists
+#   - db1's final commit (rowid 30 vs db2's rowid 20) succeeds (no false conflict)
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 5.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t5(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t5 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 commits so bSidecarLoaded=1 and sidecar is created.
+  do_test 5.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t5 VALUES(100,'db1-pre'); COMMIT }
+  } {}
+
+  do_test 5.$tn.2 {
+    # Sidecar must exist after db1's commit.
+    file exists [sidecar_path]
+  } {1}
+
+  # TRUNCATE checkpoint: WAL is reset, new generation salts written, sidecar deleted.
+  do_test 5.$tn.3 {
+    sql2 { PRAGMA wal_checkpoint(TRUNCATE) }
+    file exists [sidecar_path]
+  } {0}
+
+  # db1 commits again — incremental open fails (file gone), walRowLogReset fires.
+  # The commit itself must still succeed (no row conflict; different rows).
+  do_test 5.$tn.4 {
+    set rc [catch { sql1 {
+      BEGIN CONCURRENT; INSERT INTO t5 VALUES(200,'db1-post1'); COMMIT
+    } } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # db1 commits once more — now takes full-load path, file still absent, succeeds.
+  do_test 5.$tn.5 {
+    set rc [catch { sql1 {
+      BEGIN CONCURRENT; INSERT INTO t5 VALUES(300,'db1-post2'); COMMIT
+    } } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # db2 commits rowid 20 — creates a fresh sidecar for the new generation.
+  do_test 5.$tn.6 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t5 VALUES(20,'db2-twenty'); COMMIT }
+    file exists [sidecar_path]
+  } {1}
+
+  # db1 commits rowid 30 — full-load path reads the new sidecar, finds rowid 20,
+  # rowid 30 ≠ 20 so no conflict → SQLITE_OK.
+  do_test 5.$tn.7 {
+    set rc [catch { sql1 {
+      BEGIN CONCURRENT; INSERT INTO t5 VALUES(30,'db1-thirty'); COMMIT
+    } } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 5.$tn.8 {
+    sql1 { SELECT k FROM t5 ORDER BY k }
+  } {1 2 3 20 30 100 200 300}
+
+} ;# do_multiclient_test
+
+finish_test

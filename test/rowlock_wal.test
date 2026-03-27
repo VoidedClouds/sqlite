@@ -1,0 +1,83 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking — WAL row-log count (TESTCTRL).
+#
+# Sections:
+#   12.x  SQLITE_TESTCTRL_WAL_ROWLOG_COUNT
+#         12.1  Before any concurrent commit — log is empty (0)
+#         12.2  After first CONCURRENT commit — count is 1
+#         12.3  After second CONCURRENT commit — count is 2
+#         12.4  Full WAL checkpoint frees stale entries — count returns to 0
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+reset_db
+set ::testprefix rowlock-wal
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_wal.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--------------------------------------------------------------------------
+# Section 12: SQLITE_TESTCTRL_WAL_ROWLOG_COUNT
+#
+# The shared WAL row log grows by one WalCommitRowSet entry each time a
+# BEGIN CONCURRENT transaction commits.  After a WAL checkpoint advances
+# nBackfill past all committed frames, WalTrimCommitRows frees those entries
+# and the count returns to zero.
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 12.setup {
+  db eval { PRAGMA journal_mode = wal }
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { CREATE TABLE t12(a INTEGER PRIMARY KEY, b TEXT) }
+  set {} {}
+} {}
+
+# 12.1: Before any concurrent commit, the log is empty.
+do_test 12.1 {
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {0}
+
+# 12.2: After one CONCURRENT commit the list has exactly one entry.
+do_test 12.2 {
+  db eval { BEGIN CONCURRENT; INSERT INTO t12 VALUES(1,'one'); COMMIT }
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {1}
+
+# 12.3: A second CONCURRENT commit appends another entry.
+do_test 12.3 {
+  db eval { BEGIN CONCURRENT; INSERT INTO t12 VALUES(2,'two'); COMMIT }
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {2}
+
+# 12.4: A full WAL checkpoint (TRUNCATE) advances nBackfill to mxFrame.
+# WalTrimCommitRows is called and both stale entries are freed.
+do_test 12.4 {
+  db eval { PRAGMA wal_checkpoint(TRUNCATE) }
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {0}
+
+finish_test

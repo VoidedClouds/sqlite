@@ -118,6 +118,19 @@
 #endif
 
 /*
+** The maximum number of row-level lock entries tracked per CONCURRENT
+** transaction before falling back to page-level conflict detection.
+** The per-connection runtime default is SQLITE_MAX_ROW_LOCK_ENTRIES
+** (effectively unlimited). Use PRAGMA row_lock_threshold or
+** sqlite3_limit(SQLITE_LIMIT_ROW_LOCK_ENTRIES) to reduce it.
+** A value of 0 causes immediate spill on the very first entry, disabling
+** row-level tracking entirely for that connection.
+*/
+#ifndef SQLITE_MAX_ROW_LOCK_ENTRIES
+# define SQLITE_MAX_ROW_LOCK_ENTRIES 0x7fffffff
+#endif
+
+/*
 ** The maximum number of terms in a compound SELECT statement.
 ** The code generator for compound SELECT statements does one
 ** level of recursion for each term.  A stack overflow can result

@@ -363,6 +363,35 @@ sqlite3_uint64 sqlite3BtreeSeekCount(Btree*);
 
 int sqlite3BtreeExclusiveLock(Btree *pBt);
 
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/* Row-level lock set API (types defined in sqliteInt.h / btreeInt.h) */
+/* Check if any WRITE in pCommit overlaps a READ/WRITE in pMine. Returns:
+**   1  → conflict detected
+**   0  → no conflict
+**  -1  → unknown (either set spilled; caller uses page-level fallback)
+** bReadCommitted: if non-zero, ROW_LOCK_READ entries in pMine are ignored
+**  (only WRITE-WRITE overlaps count as conflicts). */
+int rowLockSetHasConflict(const RowLockSet *pCommit, const RowLockSet *pMine,
+                          int bReadCommitted);
+void rowLockSetFree(RowLockSet *pSet);
+void rowLockSetDetach(RowLockSet *pSet);
+RowLockSet *rowLockSetNew(sqlite3 *db);
+sqlite3 *rowLockSetGetDb(RowLockSet *pSet);
+int sqlite3BtreeRowLogCount(Btree *p);
+void sqlite3BtreeDiscardRowLocks(sqlite3 *db);
+/* Serialize pSet into a malloc'd buffer for the Option C sidecar.
+** Format: u32 nEntry, u8 bSpilled, u8[3] reserved, then per-entry data.
+** Returns NULL on OOM; caller must sqlite3_free() on success.
+** *pnOut receives the byte count (not including the surrounding mxFrame
+** prefix or trailing checksum — those are added by the WAL layer). */
+u8 *rowLockSetSerialize(const RowLockSet *pSet, u32 *pnOut);
+/* Deserialize the body produced by rowLockSetSerialize back into a new
+** detached RowLockSet.  mxFrame/iMinFrame prefix and trailing checksum
+** must be stripped by the caller before passing the body here.
+** Returns a new RowLockSet on success; NULL on OOM or corrupt data. */
+RowLockSet *rowLockSetDeserialize(const u8 *aBody, int nBody);
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING */
+
 #ifndef NDEBUG
 int sqlite3BtreeCursorIsValid(BtCursor*);
 #endif

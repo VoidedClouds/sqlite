@@ -661,6 +661,10 @@ struct Pager {
 #ifndef SQLITE_OMIT_CONCURRENT
   Bitvec *pAllRead;           /* Pages read within current CONCURRENT trans. */
 #endif
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+  RowLockSet *pCurReadRows;      /* Current txn read rows for WAL row conflict check */
+  u32 iRowLockMinFrame;           /* WAL mxFrame+1 when exclusive lock acquired */
+#endif
   sqlite3_file *fd;           /* File descriptor for database */
   sqlite3_file *jfd;          /* File descriptor for main journal */
   sqlite3_file *sjfd;         /* File descriptor for sub-journal */
@@ -1867,6 +1871,49 @@ int sqlite3PagerIsWal(Pager *pPager){
 }
 #endif /* SQLITE_OMIT_CONCURRENT */
 
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/* !defined(SQLITE_OMIT_CONCURRENT)
+**
+** Store the row lock set for the current transaction and snapshot the
+** current WAL mxFrame as the minimum frame for commit-row recording.
+** Then pass the row set down to the WAL layer which uses it during
+** conflict detection.
+*/
+void sqlite3PagerSetReadRowSet(Pager *pPager, RowLockSet *pRowLocks){
+  pPager->pCurReadRows = pRowLocks;
+  pPager->iRowLockMinFrame = sqlite3WalGetMxFrame(pPager->pWal) + 1;
+  sqlite3WalSetReadRowSet(pPager->pWal, pRowLocks);
+}
+
+/*
+** Return the number of committed row sets in the WAL row log.
+** Used by SQLITE_TESTCTRL_WAL_ROWLOG_COUNT.
+*/
+int sqlite3PagerRowLogCount(Pager *pPager){
+  return sqlite3WalGetRowLogCount(pPager->pWal);
+}
+
+/*
+** Return the Wal object associated with this pager.  Used by btree.c
+** for 3-way merge page access during RLL concurrent commit.
+** Returns NULL if this pager is not in WAL mode.
+*/
+struct Wal *sqlite3PagerGetWal(Pager *pPager){
+  return pPager->pWal;
+}
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING && !SQLITE_OMIT_CONCURRENT */
+
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+/*
+** Set read-committed isolation on the pager's WAL connection.
+** Called from btree.c when a CONCURRENT transaction begins on a
+** connection with SQLITE_ReadCommitted set.
+*/
+void sqlite3PagerSetReadCommitted(Pager *pPager, int bRC){
+  sqlite3WalSetReadCommitted(pPager->pWal, bRC);
+}
+#endif /* SQLITE_ENABLE_READ_ISOLATION && !SQLITE_OMIT_CONCURRENT */
+
 /*
 ** Free the Pager.pInJournal and Pager.pAllRead bitvec objects.
 */
@@ -2193,6 +2240,19 @@ static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
     ** locking_mode=exclusive mode but is no longer, drop the EXCLUSIVE
     ** lock held on the database file.
     */
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+    /* Record committed row sets into the shared WalRowLog BEFORE releasing
+    ** the WAL write lock.  This ensures that any other connection that
+    ** subsequently acquires the write lock and runs walFindCommitRowSet()
+    ** will find an entry for every frame this transaction wrote. */
+    if( bCommit && pPager->pCurReadRows ){
+      u32 iMaxFrame = sqlite3WalGetMxFrame(pPager->pWal);
+      sqlite3WalRecordCommitRows(pPager->pWal, pPager->pCurReadRows,
+                                 pPager->iRowLockMinFrame, iMaxFrame);
+      pPager->pCurReadRows = 0;
+      pPager->iRowLockMinFrame = 0;
+    }
+#endif
     rc2 = sqlite3WalEndWriteTransaction(pPager->pWal);
     assert( rc2==SQLITE_OK );
   }else if( rc==SQLITE_OK && bCommit && pPager->dbFileSize>pPager->dbSize ){
@@ -6557,17 +6617,29 @@ int sqlite3PagerExclusiveLock(Pager *pPager, PgHdr *pPage1, u32 *aConflict){
 #ifndef SQLITE_OMIT_CONCURRENT
     else{
       if( pPager->pAllRead ){
-        /* This is an CONCURRENT transaction. Attempt to lock the wal database
-        ** here. If SQLITE_BUSY (but not SQLITE_BUSY_SNAPSHOT) is returned,
-        ** invoke the busy-handler and try again for as long as it returns
-        ** non-zero.  */
-        do {
-          rc = sqlite3WalLockForCommit(
-              pPager->pWal, pPage1, pPager->pAllRead, aConflict
-          );
-        }while( rc==SQLITE_BUSY 
-             && pPager->xBusyHandler(pPager->pBusyHandlerArg) 
+        WalPreCheckCtx ctx;
+
+        /* Phase 1: scan for conflicts WITHOUT the WAL write lock.
+        ** The full O(WAL-frames-since-snapshot) check runs here, in
+        ** parallel with any concurrent committer that currently holds
+        ** the write lock.  On SQLITE_BUSY_SNAPSHOT a genuine conflict
+        ** was found — return immediately without retrying. */
+        rc = sqlite3WalPreCheck(
+            pPager->pWal, pPage1, pPager->pAllRead, &ctx, aConflict
         );
+
+        /* Phase 2: acquire the write lock and verify only the delta frames
+        ** committed since the pre-check.  Retry on SQLITE_BUSY (lock
+        ** temporarily held by another committer) but NOT on
+        ** SQLITE_BUSY_SNAPSHOT (genuine conflict — abort). */
+        if( rc==SQLITE_OK ){
+          do {
+            rc = sqlite3WalDeltaCheck(
+                pPager->pWal, pPage1, pPager->pAllRead, &ctx, aConflict
+            );
+          }while( rc==SQLITE_BUSY
+               && pPager->xBusyHandler(pPager->pBusyHandlerArg) );
+        }
       }
     }
 #endif /* SQLITE_OMIT_CONCURRENT */

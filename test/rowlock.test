@@ -1,0 +1,46 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Driver: sources all rowlock_*.test sub-files.
+#
+# Tests for row-level locking (SQLITE_ENABLE_ROW_LEVEL_LOCKING).
+#
+# Sub-files:
+#   rowlock_basic.test      - sections 1-2   basic write-conflict detection
+#   rowlock_savepoint.test  - sections 3-5   savepoint interactions
+#   rowlock_threshold.test  - sections 6,10,11,13,14,15  threshold/spill/memory/fallback
+#   rowlock_blobkey.test    - section  8     BLOBKEY (index b-tree) conflicts
+#   rowlock_ddl.test        - section  9     DDL detection / CONCURRENT_SCHEMA
+#   rowlock_wal.test        - section  12    WAL row-log count (TESTCTRL)
+#   rowlock_sidecar.test    - section  14    sidecar lifecycle and cross-process
+#   rowlock_wal2.test       - sections 20-28 WAL2 dual-sidecar row-log
+
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Set ::SLAVE so that finish_test inside each sub-file calls finish_test_precleanup
+# (resetting per-file state) but does NOT call finalize_testing / exit.
+set ::SLAVE 1
+
+source $testdir/rowlock_basic.test
+source $testdir/rowlock_savepoint.test
+source $testdir/rowlock_threshold.test
+source $testdir/rowlock_blobkey.test
+source $testdir/rowlock_ddl.test
+source $testdir/rowlock_wal.test
+reset_db
+source $testdir/rowlock_sidecar.test
+reset_db
+source $testdir/rowlock_wal2.test
+
+# All sub-files done. Produce the combined summary.
+unset ::SLAVE
+finish_test

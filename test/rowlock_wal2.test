@@ -1,0 +1,576 @@
+# 2026 March 27
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking under WAL2 mode.
+#
+# Sections:
+#   20.x  Basic non-overlapping rowid writes commit under WAL2
+#   21.x  Overlapping rowid writes produce SQLITE_BUSY_SNAPSHOT under WAL2
+#   22.x  WAL2 sidecar file lifecycle (create, checkpoint delete, close delete)
+#   23.x  Row-log count via TESTCTRL under WAL2 (including trim after ckpt)
+#   24.x  WAL2 sidecar survives file switch (cross-process)
+#   25.x  Correct sidecar file is created per active WAL file
+#   26.x  Per-file checkpoint deletes only that file's sidecar
+#   27.x  Cross-process incremental sidecar load under WAL2
+#   28.x  Generation reset after WAL2 checkpoint + new sidecar load
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-wal2
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_wal2.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+# Helpers: paths to the two sidecar files.
+proc sidecar0 {} { return "[file normalize test.db]-rowlog" }
+proc sidecar1 {} { return "[file normalize test.db]-wal2-rowlog" }
+
+#--------------------------------------------------------------------------
+# Section 20: Non-overlapping rowid writes under WAL2
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 20.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 20.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(10, 'ten');
+    }
+  } {}
+
+  do_test 20.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(20, 'twenty');
+      COMMIT;
+    }
+  } {}
+
+  # Non-overlapping rowids — should commit cleanly under WAL2.
+  do_test 20.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 20.$tn.4 {
+    sql1 { SELECT k FROM t1 ORDER BY k }
+  } {1 2 3 4 5 10 20}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 21: Overlapping rowid writes under WAL2
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 21.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 21.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(99, 'db1');
+    }
+  } {}
+
+  do_test 21.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(99, 'db2');
+      COMMIT;
+    }
+  } {}
+
+  # Same rowid — should get BUSY_SNAPSHOT.
+  do_test 21.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }] \
+              [code1 { sqlite3_get_autocommit db }]
+  } {1 SQLITE_BUSY_SNAPSHOT 0}
+
+  do_test 21.$tn.4 { sql1 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 22: WAL2 sidecar file lifecycle
+#
+#   22.1  No sidecars before first CONCURRENT commit
+#   22.2  At least one sidecar exists after a CONCURRENT commit
+#   22.3  Sidecar survives PASSIVE checkpoint (still needed by readers)
+#   22.4  sqlite3WalClose (with isDelete) removes both sidecars
+#   22.5  Another CONCURRENT commit recreates a sidecar
+#   22.6  PASSIVE checkpoint does not remove the sidecar
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 22.1.setup {
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval {
+    PRAGMA row_level_locking = 1;
+    CREATE TABLE t2(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t2 VALUES(1, 'one');
+  }
+} {}
+
+# No sidecars before a CONCURRENT commit.
+do_test 22.1 {
+  list [file exists [sidecar0]] [file exists [sidecar1]]
+} {0 0}
+
+# A CONCURRENT commit creates at least one sidecar.
+do_test 22.2 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t2 VALUES(2, 'two');
+    COMMIT;
+  }
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+# PASSIVE checkpoint does not delete the sidecar (data still needed).
+do_test 22.3 {
+  db eval { PRAGMA wal_checkpoint(PASSIVE) }
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+# Close and reopen — sqlite3WalClose does an exhaustive 2-pass checkpoint
+# in WAL2 mode and deletes both WAL and sidecar files.
+do_test 22.4 {
+  db close
+  list [file exists [sidecar0]] [file exists [sidecar1]]
+} {0 0}
+
+# Reopen, set up, and commit again — sidecar is recreated.
+sqlite3 db test.db
+do_test 22.5 {
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval {
+    PRAGMA row_level_locking = 1;
+    BEGIN CONCURRENT;
+      INSERT INTO t2 VALUES(3, 'three');
+    COMMIT;
+  }
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+# PASSIVE checkpoint still does not remove the sidecar.
+do_test 22.6 {
+  db eval { PRAGMA wal_checkpoint(PASSIVE) }
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+#--------------------------------------------------------------------------
+# Section 23: Row-log count under WAL2 via TESTCTRL, including trim
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 23.setup {
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval { PRAGMA wal_autocheckpoint = 0; }
+  db eval {
+    PRAGMA row_level_locking = 1;
+    CREATE TABLE t3(k INTEGER PRIMARY KEY, v TEXT);
+  }
+} {}
+
+# Count grows with each commit.
+do_test 23.1 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t3 VALUES(1, 'a');
+    COMMIT;
+  }
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {1}
+
+do_test 23.2 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t3 VALUES(2, 'b');
+    COMMIT;
+  }
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {2}
+
+do_test 23.3 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t3 VALUES(3, 'c');
+    COMMIT;
+  }
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {3}
+
+# After a PASSIVE checkpoint trims the backfilled entries the count
+# should decrease (or stay the same if the checkpoint couldn't run yet).
+# Close and reopen to force a full checkpoint that trims everything.
+do_test 23.4 {
+  db close
+  sqlite3 db test.db
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval { PRAGMA row_level_locking = 1; }
+  # The close/reopen did a full checkpoint — row log should be empty.
+  sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT db
+} {0}
+
+#--------------------------------------------------------------------------
+# Section 24: Non-overlapping writes across file switch
+#
+# Force a WAL file switch between two concurrent transactions to verify
+# that sidecar data for the old file is still available for conflict
+# resolution when the second commit lands on the new file.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 24.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      PRAGMA wal_autocheckpoint = 0;
+      CREATE TABLE t4(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t4 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # Fill up the first WAL file to force a switch.
+  do_test 24.$tn.1 {
+    sql1 {
+      INSERT INTO t4 SELECT k+100, v FROM t4;
+      INSERT INTO t4 SELECT k+200, v FROM t4;
+    }
+  } {}
+
+  # db1 starts concurrent transaction.
+  do_test 24.$tn.2 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t4 VALUES(1000, 'db1');
+    }
+  } {}
+
+  # db2 commits a non-overlapping row — may go to the other WAL file.
+  do_test 24.$tn.3 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t4 VALUES(2000, 'db2');
+      COMMIT;
+    }
+  } {}
+
+  # db1 should commit cleanly — no overlap.
+  do_test 24.$tn.4 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 24.$tn.5 {
+    sql1 { SELECT count(*) FROM t4 }
+  } {22}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 25: Correct sidecar file is created per active WAL file
+#
+# Verify that a CONCURRENT commit creates a sidecar file whose name
+# corresponds to the active WAL file at the time of the commit.  Force
+# a file switch to show that the second sidecar is distinct.
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 25.setup {
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval { PRAGMA wal_autocheckpoint = 0; }
+  db eval {
+    PRAGMA row_level_locking = 1;
+    CREATE TABLE t5(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t5 VALUES(1,'a'),(2,'b'),(3,'c');
+  }
+} {}
+
+# First commit — goes to whichever WAL file is active (file 0 initially).
+do_test 25.1 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t5 VALUES(10, 'ten');
+    COMMIT;
+  }
+  # At minimum the file-0 sidecar should exist after a fresh DB.
+  file exists [sidecar0]
+} {1}
+
+# Force a file switch by writing enough data to exceed the WAL size
+# threshold and then doing more writes.
+do_test 25.2 {
+  for {set i 100} {$i < 200} {incr i} {
+    db eval "INSERT INTO t5 VALUES($i, 'fill-$i')"
+  }
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t5 VALUES(500, 'after-switch');
+    COMMIT;
+  }
+  # Both sidecars may exist, or just the second one if the first was checkpointed.
+  # The key assertion: at least one sidecar exists.
+  expr { [file exists [sidecar0]] || [file exists [sidecar1]] }
+} {1}
+
+# Data integrity check.
+do_test 25.3 {
+  db eval { SELECT count(*) FROM t5 WHERE k>=100 AND k<200 }
+} {100}
+
+#--------------------------------------------------------------------------
+# Section 26: Per-file checkpoint deletes checkpointed file's sidecar
+#
+# After a PASSIVE checkpoint under WAL2, the non-active WAL file is
+# checkpointed and its sidecar is deleted, while any sidecar for the
+# active file remains.  We verify this by observing that:
+#   - After commits to the initial file, a sidecar exists.
+#   - After a PASSIVE checkpoint, that sidecar is deleted (the
+#     checkpointed file is fully backfilled).
+#   - Subsequent commits create sidecar(s) for the new active file.
+#   - Close cleans up everything.
+#--------------------------------------------------------------------------
+
+reset_db
+do_test 26.setup {
+  db eval { PRAGMA journal_mode = wal2; }
+  db eval { PRAGMA wal_autocheckpoint = 0; }
+  db eval {
+    PRAGMA row_level_locking = 1;
+    CREATE TABLE t6(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t6 VALUES(1,'a'),(2,'b'),(3,'c');
+  }
+} {}
+
+# Count how many sidecar files currently exist.
+proc count_sidecars {} {
+  set n 0
+  if {[file exists [sidecar0]]} { incr n }
+  if {[file exists [sidecar1]]} { incr n }
+  return $n
+}
+
+# Commit on the initial active file → creates at least one sidecar.
+do_test 26.1 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t6 VALUES(10, 'ten');
+    COMMIT;
+  }
+  expr { [count_sidecars] >= 1 }
+} {1}
+
+# Remember which sidecars exist before checkpoint.
+set pre_sc0 [file exists [sidecar0]]
+set pre_sc1 [file exists [sidecar1]]
+
+# Force a file switch by filling up the current WAL file.
+do_test 26.2 {
+  for {set i 100} {$i < 200} {incr i} {
+    db eval "INSERT INTO t6 VALUES($i, 'fill-$i')"
+  }
+  # Commit on the (possibly switched) active file.
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t6 VALUES(500, 'five-hundred');
+    COMMIT;
+  }
+  set x ok
+} {ok}
+
+# PASSIVE checkpoint: checkpoints the non-active file.
+# After checkpoint, the total sidecar count should have decreased
+# or remain stable (the checkpointed file's sidecar is deleted).
+do_test 26.3 {
+  db eval { PRAGMA wal_checkpoint(PASSIVE) }
+  # At least the currently active file's sidecar should still exist
+  # (it has un-checkpointed CONCURRENT commits).
+  expr { [count_sidecars] >= 1 }
+} {1}
+
+# Close cleans up everything.
+do_test 26.4 {
+  db close
+  list [file exists [sidecar0]] [file exists [sidecar1]]
+} {0 0}
+
+sqlite3 db test.db
+
+#--------------------------------------------------------------------------
+# Section 27: Cross-process incremental sidecar load under WAL2
+#
+# This mirrors Section 4 of rowlock_sidecar.test but under WAL2 mode.
+#
+#   db1 commits rowid 100 (creates sidecar, sets abSidecarLoaded[iWal]=1)
+#   db2 commits rowid 20  (appends new record to the same sidecar file)
+#   db1 commits rowid 30  (incremental load picks up db2's record; 30≠20 → OK)
+#
+# For tn=1 (cross-process): without incremental sidecar load, db1 would
+# see a page-level conflict (rows 20 and 30 share a page) and return
+# SQLITE_BUSY_SNAPSHOT.  The incremental load resolves the false conflict.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 27.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE t7(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t7 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # Step 1: db1 commits first — establishes sidecar and abSidecarLoaded.
+  do_test 27.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t7 VALUES(100, 'db1-first'); COMMIT; }
+  } {}
+
+  # Step 2: db2 commits rowid 20 — appends a new sidecar record.
+  do_test 27.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t7 VALUES(20, 'db2-twenty'); COMMIT; }
+  } {}
+
+  # Step 3: db1 writes rowid 30 then tries to commit.
+  do_test 27.$tn.3 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t7 VALUES(30, 'db1-thirty'); }
+  } {}
+
+  # Incremental load picks up db2's record; rowid 30 ≠ 20 → no conflict.
+  do_test 27.$tn.4 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 27.$tn.5 {
+    sql1 { SELECT k FROM t7 ORDER BY k }
+  } {1 2 3 20 30 100}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 28: Generation reset after WAL2 checkpoint
+#
+# Verify that after a full checkpoint resets the WAL generation:
+#   - Old sidecar files are deleted
+#   - New commits create fresh sidecars
+#   - Cross-process conflict resolution still works with the new sidecar
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 28.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal2;
+      CREATE TABLE t8(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t8 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1 commits — creates a sidecar.
+  do_test 28.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t8 VALUES(100,'pre-ckpt'); COMMIT; }
+  } {}
+
+  # db2 does a full checkpoint (close+reopen forces 2-pass ckpt in WAL2).
+  # After this the WAL generation is reset and old sidecars are deleted.
+  do_test 28.$tn.2 {
+    # Use PASSIVE checkpoint twice to checkpoint both WAL files.
+    sql2 { PRAGMA wal_checkpoint(PASSIVE) }
+    sql2 { PRAGMA wal_checkpoint(PASSIVE) }
+    set x 1
+  } {1}
+
+  # db1 commits again — should succeed despite generation change.
+  do_test 28.$tn.3 {
+    set rc [catch { sql1 {
+      BEGIN CONCURRENT; INSERT INTO t8 VALUES(200,'post-ckpt1'); COMMIT;
+    } } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # db2 commits rowid 20 — creates a new sidecar for the new generation.
+  do_test 28.$tn.4 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t8 VALUES(20,'db2-twenty'); COMMIT; }
+  } {}
+
+  # db1 commits rowid 30 — must load the new sidecar, find 30≠20, succeed.
+  do_test 28.$tn.5 {
+    set rc [catch { sql1 {
+      BEGIN CONCURRENT; INSERT INTO t8 VALUES(30,'db1-thirty'); COMMIT;
+    } } msg]
+    list $rc $msg
+  } {0 {}}
+
+  # db2 commits rowid 30 — real conflict with db1's committed rowid 30.
+  do_test 28.$tn.6 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t8 VALUES(40,'db1-forty'); }
+  } {}
+
+  do_test 28.$tn.7 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t8 VALUES(40,'db2-forty'); COMMIT; }
+  } {}
+
+  do_test 28.$tn.8 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }]
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  catch { sql1 ROLLBACK }
+
+  # Final data integrity check.
+  do_test 28.$tn.9 {
+    sql1 { SELECT k FROM t8 ORDER BY k }
+  } {1 2 3 20 30 40 100 200}
+
+} ;# do_multiclient_test
+
+finish_test

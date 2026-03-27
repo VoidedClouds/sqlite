@@ -1,0 +1,351 @@
+# 2026 March 27
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for read isolation (SQLITE_ENABLE_READ_ISOLATION) WITHOUT
+# row-level locking.  These tests exercise page-level read-committed
+# isolation: read-only page conflicts are skipped, write-write page
+# conflicts are still detected.
+#
+# IMPORTANT: Page-level read-committed only helps when the pages READ
+# by the current transaction are DIFFERENT from the pages it WRITES.
+# If a transaction reads AND writes the same page, that page is dirty
+# and a conflict will be detected as write-write.  Test data is designed
+# to span multiple pages so reads and writes land on different leaves.
+#
+# Sections:
+#   1.x  PRAGMA isolation_level — default and round-trip
+#   2.x  Read-write page conflict ignored in read_committed mode
+#   3.x  Write-write page conflict still detected in read_committed mode
+#   4.x  Snapshot mode still raises BUSY_SNAPSHOT on read-write conflicts
+#   5.x  Read-committed: same-page read+write still conflicts (page is dirty)
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix read-iso
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+# Detect SQLITE_ENABLE_READ_ISOLATION: try setting read_committed and see
+# if it sticks.  Without the flag the pragma is not available.
+set has_ri 0
+catch {
+  db eval { PRAGMA isolation_level = read_committed }
+  set val [db eval { PRAGMA isolation_level }]
+  if { $val eq "read_committed" } { set has_ri 1 }
+  db eval { PRAGMA isolation_level = snapshot }
+}
+if { $has_ri == 0 } {
+  puts "read_isolation.test: SQLITE_ENABLE_READ_ISOLATION not compiled in - skipping"
+  finish_test
+  return
+}
+
+# Disable RLL if it happens to be compiled in — these tests exercise
+# pure page-level read-committed behaviour.
+catch { db eval { PRAGMA row_level_locking = 0 } }
+
+#--------------------------------------------------------------------------
+# Helper: populate a table with enough data to span multiple leaf pages.
+# With page_size=1024 and ~80-byte rows, ~12 rows/page.
+# We insert rows 1..60 to get ~5 pages.  Row 1 is near the start (low
+# page), row 9999 goes to a new page at the end.
+#--------------------------------------------------------------------------
+
+proc populate_multipage {dbcmd tbl} {
+  $dbcmd eval "CREATE TABLE IF NOT EXISTS $tbl (k INTEGER PRIMARY KEY, v TEXT)"
+  $dbcmd eval "DELETE FROM $tbl"
+  set vals [list]
+  for {set i 1} {$i <= 60} {incr i} {
+    lappend vals "($i,'val_[format %060d $i]')"
+  }
+  $dbcmd eval "INSERT INTO $tbl VALUES [join $vals ,]"
+}
+
+#--------------------------------------------------------------------------
+# 1.x: PRAGMA isolation_level — default and round-trip
+#--------------------------------------------------------------------------
+
+do_test 1.1.default {
+  catch { db close }
+  sqlite3 db test.db
+  db eval { PRAGMA isolation_level }
+} {snapshot}
+
+do_test 1.2.set_read_committed {
+  db eval { PRAGMA isolation_level = read_committed }
+} {read_committed}
+
+do_test 1.3.set_snapshot {
+  db eval { PRAGMA isolation_level = snapshot }
+} {snapshot}
+
+do_test 1.4.unknown_value_reverts_to_snapshot {
+  db eval { PRAGMA isolation_level = serializable }
+} {snapshot}
+
+catch { db close }
+
+#--------------------------------------------------------------------------
+# 2.x: Read-write page conflict is IGNORED in read_committed mode
+#
+# Data spans multiple pages.  db1 reads rows in the low range (pages 2-3),
+# then inserts row 9999 which goes to a NEW page at the end.
+# db2 updates row 1 (page in the low range) and commits.
+# db1's read page was NOT dirtied → RC skips it → commit succeeds.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      PRAGMA page_size = 1024;
+    }
+    code1 { populate_multipage db t2 }
+    code1 {
+      catch { db eval { PRAGMA row_level_locking = 0 } }; list
+      db eval { PRAGMA isolation_level = read_committed }; list
+    }
+    code2 {
+      catch { db2 eval { PRAGMA row_level_locking = 0 } }; list
+    }
+  } {}
+
+  # db1: read rows 1-3 (low pages), then insert far away (new page)
+  do_test 2.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        SELECT k FROM t2 WHERE k <= 3;
+    }
+  } {1 2 3}
+
+  do_test 2.$tn.1b {
+    sql1 { INSERT INTO t2 VALUES(9999, 'far_away_new_row'); }
+  } {}
+
+  # db2 updates row 1 (same page db1 read, but db1 didn't dirty it)
+  do_test 2.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t2 SET v = 'MODIFIED' WHERE k = 1;
+      COMMIT;
+    }
+  } {}
+
+  # db1 COMMIT:
+  # - tn==1 (cross-process): WAL write lock contention possible
+  # - tn==2 (in-process): read-only page → RC skips → commit succeeds
+  do_test 2.$tn.3 {
+    if {$tn == 1} {
+      catch { sql1 COMMIT }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch { sql1 COMMIT } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  catch { sql2 ROLLBACK }
+  catch { sql1 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 3.x: Write-write page conflict is STILL detected in read_committed mode
+#
+# Both db1 and db2 UPDATE the same row on the same page.
+# db2 commits first.  db1 must get SQLITE_BUSY_SNAPSHOT even in RC mode
+# because the dirty page overlaps.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      PRAGMA page_size = 1024;
+    }
+    code1 { populate_multipage db t3 }
+    code1 {
+      catch { db eval { PRAGMA row_level_locking = 0 } }; list
+      db eval { PRAGMA isolation_level = read_committed }; list
+    }
+    code2 {
+      catch { db2 eval { PRAGMA row_level_locking = 0 } }; list
+    }
+  } {}
+
+  # db1 updates row 1 (page becomes dirty)
+  do_test 3.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t3 SET v = 'db1_val' WHERE k = 1;
+    }
+  } {}
+
+  # db2 also updates row 1 and commits first
+  do_test 3.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t3 SET v = 'db2_val' WHERE k = 1;
+      COMMIT;
+    }
+  } {}
+
+  # Write-write page conflict → BUSY_SNAPSHOT even in RC mode
+  do_test 3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 4.x: Snapshot mode still raises BUSY_SNAPSHOT on read-write page conflicts
+#
+# db1 (snapshot, no RLL): reads rows on one page, db2 writes the same page.
+# Snapshot mode must detect the conflict even though db1 only read it.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 4.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      PRAGMA page_size = 1024;
+    }
+    code1 { populate_multipage db t4 }
+    code1 {
+      catch { db eval { PRAGMA row_level_locking = 0 } }; list
+      db eval { PRAGMA isolation_level = snapshot }; list
+    }
+    code2 {
+      catch { db2 eval { PRAGMA row_level_locking = 0 } }; list
+    }
+  } {}
+
+  # db1 reads rows 1-3 (page enters pAllRead)
+  do_test 4.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        SELECT k FROM t4 WHERE k <= 3;
+    }
+  } {1 2 3}
+
+  # Insert far away so db1 has a dirty page for commit
+  do_test 4.$tn.1b {
+    sql1 { INSERT INTO t4 VALUES(9999, 'new_row'); }
+  } {}
+
+  # db2 updates row 1 and commits
+  do_test 4.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t4 SET v = 'MODIFIED' WHERE k = 1;
+      COMMIT;
+    }
+  } {}
+
+  # Snapshot mode: the read-page overlap must produce BUSY_SNAPSHOT
+  do_test 4.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 5.x: Read-committed: same-page read+write still conflicts
+#
+# When the transaction both reads AND writes the SAME page, the page is
+# dirty.  Even in RC mode, a dirty-page overlap is a write-write conflict.
+# This test uses a small table where all rows fit on one page.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 5.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t5(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t5;
+      INSERT INTO t5 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      catch { db eval { PRAGMA row_level_locking = 0 } }; list
+      db eval { PRAGMA isolation_level = read_committed }; list
+    }
+    code2 {
+      catch { db2 eval { PRAGMA row_level_locking = 0 } }; list
+    }
+  } {}
+
+  # db1: read AND write on the same page (small table, one leaf page)
+  do_test 5.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        SELECT v FROM t5 WHERE k = 10;
+    }
+  } {ten}
+
+  do_test 5.$tn.1b {
+    # Insert on the same small page
+    sql1 { INSERT INTO t5 VALUES(30, 'thirty'); }
+  } {}
+
+  # db2 updates row 10 (same page) and commits
+  do_test 5.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # Even in RC mode, page is dirty → write-write page conflict
+  do_test 5.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+finish_test

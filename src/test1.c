@@ -7477,6 +7477,7 @@ static int SQLITE_TCLAPI test_limit(
     { "SQLITE_LIMIT_VARIABLE_NUMBER",     SQLITE_LIMIT_VARIABLE_NUMBER      },
     { "SQLITE_LIMIT_TRIGGER_DEPTH",       SQLITE_LIMIT_TRIGGER_DEPTH        },
     { "SQLITE_LIMIT_WORKER_THREADS",      SQLITE_LIMIT_WORKER_THREADS       },
+    { "SQLITE_LIMIT_ROW_LOCK_ENTRIES",    SQLITE_LIMIT_ROW_LOCK_ENTRIES     },
     
     /* Out of range test cases */
     { "SQLITE_LIMIT_TOOSMALL",            -1,                               },
@@ -8115,6 +8116,7 @@ static int SQLITE_TCLAPI test_test_control(
     { "SQLITE_TESTCTRL_IMPOSTER",           SQLITE_TESTCTRL_IMPOSTER        },
     { "SQLITE_TESTCTRL_INTERNAL_FUNCTIONS", SQLITE_TESTCTRL_INTERNAL_FUNCTIONS},
     { "SQLITE_TESTCTRL_FK_NO_ACTION",       SQLITE_TESTCTRL_FK_NO_ACTION},
+    { "SQLITE_TESTCTRL_WAL_ROWLOG_COUNT",    SQLITE_TESTCTRL_WAL_ROWLOG_COUNT},
     { 0, 0 }
   };
   int iVerb;
@@ -8195,6 +8197,22 @@ static int SQLITE_TCLAPI test_test_control(
       if( Tcl_GetIntFromObj(interp, objv[5], &tnum) ) return TCL_ERROR;
       sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, db, zDbName, onOff, tnum);
       break;
+    }
+
+    case SQLITE_TESTCTRL_WAL_ROWLOG_COUNT: {
+      /* sqlite3_test_control SQLITE_TESTCTRL_WAL_ROWLOG_COUNT DB
+      ** Returns the number of WalCommitRowSet entries currently held in the
+      ** shared WAL row log for the main database of DB. */
+      sqlite3 *db = 0;
+      int n = 0;
+      if( objc!=3 ){
+        Tcl_WrongNumArgs(interp, 2, objv, "DB");
+        return TCL_ERROR;
+      }
+      if( getDbPointer(interp, Tcl_GetString(objv[2]), &db) ) return TCL_ERROR;
+      sqlite3_test_control(SQLITE_TESTCTRL_WAL_ROWLOG_COUNT, db, &n);
+      Tcl_SetObjResult(interp, Tcl_NewIntObj(n));
+      return TCL_OK;
     }
   }
 

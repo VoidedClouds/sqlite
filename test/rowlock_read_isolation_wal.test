@@ -1,0 +1,387 @@
+# 2026 March 27
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking COMBINED with read isolation.
+# These tests require BOTH SQLITE_ENABLE_ROW_LEVEL_LOCKING and
+# SQLITE_ENABLE_READ_ISOLATION to be compiled in.
+#
+# Sections:
+#   1.x  Read-write row conflict ignored in read_committed + RLL mode
+#   2.x  Write-write row conflict still detected in read_committed + RLL mode
+#   3.x  Snapshot + RLL still raises BUSY_SNAPSHOT on read-write row conflicts
+#   4.x  Read-first snapshot detection with RLL (eager pRowLocks)
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-ri
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+# Require SQLITE_ENABLE_ROW_LEVEL_LOCKING
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_read_isolation.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+# Require SQLITE_ENABLE_READ_ISOLATION
+set has_ri 0
+catch {
+  db eval { PRAGMA isolation_level = read_committed }
+  set val [db eval { PRAGMA isolation_level }]
+  if { $val eq "read_committed" } { set has_ri 1 }
+  db eval { PRAGMA isolation_level = snapshot }
+}
+if { $has_ri == 0 } {
+  puts "rowlock_read_isolation.test: SQLITE_ENABLE_READ_ISOLATION not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--------------------------------------------------------------------------
+# 1.x: Read-write row conflict is IGNORED in read_committed + RLL mode
+#
+# db1 (read_committed + RLL): inserts a new row, then scans to record
+# ROW_LOCK_READ for rowids 10 and 20.
+# db2 updates row 10 and commits.
+# db1 COMMIT must succeed: read_committed ignores ROW_LOCK_READ entries
+# at the row level.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 1.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t1(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t1;
+      INSERT INTO t1 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # INSERT first → creates pRowLocks (write mode).
+  # Then SELECT rowid scan → OP_Rowid fires → ROW_LOCK_READ for rowids 10, 20
+  # (but in RC mode, the P1 optimisation skips ROW_LOCK_READ recording).
+  do_test 1.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(99, 'ninetynine');
+        SELECT rowid FROM t1 WHERE rowid < 50;
+    }
+  } {10 20}
+
+  # db2 updates row 10 and commits (ROW_LOCK_WRITE for rowid 10).
+  do_test 1.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t1 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # In read_committed (tn==2): ROW_LOCK_READ for row 10 vs db2's WRITE is NOT
+  # a conflict → db1 commits cleanly.
+  # Cross-process (tn==1): WAL write lock causes "database is locked".
+  do_test 1.$tn.3 {
+    if {$tn == 1} {
+      catch { sql1 COMMIT }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch { sql1 COMMIT } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  catch { sql2 ROLLBACK }
+  catch { sql1 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 2.x: Write-write row conflict is STILL detected in read_committed + RLL
+#
+# db1 updates row 10 in a CONCURRENT txn.
+# db2 also updates row 10 and commits first.
+# db1 should still get SQLITE_BUSY_SNAPSHOT because it is a WRITE-WRITE
+# conflict (RLL detects it at the row level).
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t2(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t2;
+      INSERT INTO t2 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # db1 updates row 10 (ROW_LOCK_WRITE)
+  do_test 2.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t2 SET v = 'TEN_db1' WHERE k = 10;
+    }
+  } {}
+
+  # db2 updates the same row 10 and commits first
+  do_test 2.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t2 SET v = 'TEN_db2' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # db1's COMMIT should fail — write-write conflict even in read_committed.
+  do_test 2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 3.x: Snapshot + RLL still raises BUSY_SNAPSHOT on read-write row conflicts
+#
+# Regression guard: read_committed must not bleed into snapshot mode.
+# db1 (snapshot + RLL): inserts row 99 then scans, recording ROW_LOCK_READ.
+# db2 updates row 10 and commits.
+# At db1 COMMIT: rowLockSetHasConflict finds ROW_LOCK_WRITE (pCommit)
+# vs ROW_LOCK_READ (pMine) with bRC=0 → BUSY_SNAPSHOT.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t3(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t3;
+      INSERT INTO t3 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = snapshot }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # INSERT first → creates pRowLocks (write mode).
+  # Then SELECT rowid scan → OP_Rowid fires → ROW_LOCK_READ for rowids 10, 20.
+  do_test 3.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t3 VALUES(99, 'ninetynine');
+        SELECT rowid FROM t3 WHERE rowid < 50;
+    }
+  } {10 20}
+
+  do_test 3.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t3 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # In snapshot mode the read-write conflict must produce BUSY_SNAPSHOT.
+  do_test 3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 4.x: Read-first snapshot detection with RLL (eager pRowLocks)
+#
+# With pRowLocks allocated at BEGIN CONCURRENT, a pure read-first sequence
+# correctly records ROW_LOCK_READ entries from the first SELECT, without
+# needing a prior write.  Snapshot isolation must still raise BUSY_SNAPSHOT
+# when a concurrent writer modifies a row that db1's SELECT covered.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 4.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t4(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t4;
+      INSERT INTO t4 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = snapshot }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # Read-first: SELECT runs before any write; pRowLocks is allocated at
+  # BEGIN CONCURRENT so ROW_LOCK_READ for rowids 10 and 20 are recorded.
+  do_test 4.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        SELECT rowid FROM t4 WHERE rowid < 50;
+    }
+  } {10 20}
+
+  # INSERT gives db1 a dirty page so COMMIT actually writes to WAL.
+  do_test 4.$tn.2 {
+    sql1 { INSERT INTO t4 VALUES(99, 'ninetynine'); }
+  } {}
+
+  # db2 updates row 10 and commits.
+  do_test 4.$tn.3 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t4 SET v = 'TEN' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # Snapshot must raise BUSY_SNAPSHOT.
+  do_test 4.$tn.4 {
+    set rc [catch { sql1 COMMIT } msg]
+    if {$tn == 1} {
+      expr { $rc != 0 }
+    } else {
+      set ext [code1 { sqlite3_extended_errcode db }]
+      list $rc $ext
+    }
+  } [expr {$tn == 1 ? 1 : {1 SQLITE_BUSY_SNAPSHOT}}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+#--------------------------------------------------------------------------
+# 5.x: Read-committed + RLL: disjoint writes on same page succeed
+#
+# This is the key combined benefit: page-level conflict fires, but RLL
+# resolves it at the row level.  In read_committed mode, ROW_LOCK_READ
+# entries are also skipped, allowing even more concurrency.
+#
+# db1 writes row 20, reads row 10.
+# db2 writes row 10 and commits.
+# Without RLL this would be BUSY_SNAPSHOT (page-level write-write).
+# With RLL the rows are disjoint → no row conflict.
+# With RC, the read of row 10 doesn't count either.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 5.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t5(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t5;
+      INSERT INTO t5 VALUES(10,'ten'),(20,'twenty');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+    }
+  } {}
+
+  # db1: update row 20 and read row 10
+  do_test 5.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TWENTY_db1' WHERE k = 20;
+        SELECT v FROM t5 WHERE k = 10;
+    }
+  } {ten}
+
+  # db2: update row 10 (same page, different row) and commit
+  do_test 5.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        UPDATE t5 SET v = 'TEN_db2' WHERE k = 10;
+      COMMIT;
+    }
+  } {}
+
+  # db1 COMMIT: RLL resolves the page conflict (disjoint rows).
+  # RC means the read of row 10 is also ignored.
+  do_test 5.$tn.3 {
+    if {$tn == 1} {
+      catch { sql1 COMMIT }
+      catch { sql1 ROLLBACK }
+      set result locked_expected
+    } else {
+      set rc [catch { sql1 COMMIT } msg]
+      if {$rc == 0} {
+        set result ok
+      } else {
+        set result "FAIL: $msg"
+      }
+    }
+    set result
+  } [expr {$tn == 1 ? "locked_expected" : "ok"}]
+
+  catch { sql1 ROLLBACK }
+  catch { sql2 ROLLBACK }
+}
+
+finish_test

@@ -1,0 +1,210 @@
+# 2026 March 05
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for row-level locking — savepoint interactions.
+#
+# Sections:
+#   3.x  Phase 7: Savepoint rollback removes row-lock entries
+#   4.x  Savepoint release (RELEASE SAVEPOINT) preserves row-lock entries
+#   5.x  Nested savepoints with rollback at an intermediate level
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix rowlock-svpt
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+set has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set has_rll 1
+}
+if { $has_rll == 0 } {
+  puts "rowlock_savepoint.test: SQLITE_ENABLE_ROW_LEVEL_LOCKING not compiled in - skipping"
+  finish_test
+  return
+}
+
+#--------------------------------------------------------------------------
+# Section 3: Phase 7 — Savepoint rollback removes row-lock entries
+#
+# db1 writes rowid 10 inside a savepoint, then rolls back that savepoint.
+# db2 then writes rowid 10 and commits.
+# db1 should be able to commit cleanly because its write to rowid 10
+# was rolled back and is no longer in its row-lock set.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  # db1: open CONCURRENT, write rowid 5 (will keep), savepoint, write rowid 10
+  do_test 3.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(5, 'five');
+        SAVEPOINT s1;
+          INSERT INTO t1 VALUES(10, 'ten');
+        ROLLBACK TO s1;
+        RELEASE s1;
+    }
+  } {}
+
+  # db2: write rowid 10 and commit.
+  do_test 3.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(10, 'db2-ten');
+      COMMIT;
+    }
+  } {}
+
+  # db1: commit — should succeed because its write to rowid 10 was rolled back.
+  # Cross-process sidecar load enables row-level check for tn=1 too; the
+  # rolled-back rowid 10 is not in db1's write set, so no conflict.
+  do_test 3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    code1 { list $::rc [sqlite3_extended_errcode db] }
+  } {0 SQLITE_OK}
+
+  do_test 3.$tn.4 {
+    sql1 { SELECT k, v FROM t1 ORDER BY k }
+  } {1 a 2 b 3 c 5 five 10 db2-ten}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 4: Savepoint RELEASE preserves row-lock entries
+#
+# db1 inserts rowid 10 inside a savepoint and then RELEASEs (commits) the
+# savepoint.  db2 writes rowid 10 and commits.  db1's commit must fail with
+# SQLITE_BUSY_SNAPSHOT because rowid 10 is still in its write set.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 4.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 4.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        SAVEPOINT s1;
+          INSERT INTO t1 VALUES(10, 'ten');
+        RELEASE s1;
+    }
+  } {}
+
+  do_test 4.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(10, 'db2-ten');
+      COMMIT;
+    }
+  } {}
+
+  # db1 should fail: rowid 10 write was released (not rolled back) so it
+  # remains in the row-lock set and conflicts with db2's commit.
+  do_test 4.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    set ext [code1 { sqlite3_extended_errcode db }]
+    code1 { sqlite3_get_autocommit db }
+    list $rc $ext
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  do_test 4.$tn.4 { sql1 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+#--------------------------------------------------------------------------
+# Section 5: Nested savepoints — rollback at inner level only
+#
+# db1: BEGIN CONCURRENT
+#       write rowid 1  (outer scope)
+#       SAVEPOINT s1
+#         write rowid 2
+#         SAVEPOINT s2
+#           write rowid 3
+#         ROLLBACK TO s2    <- removes rowid 3 from lock set only
+#       RELEASE s1          <- merges rowid 2 into outer scope
+#
+# db2: writes rowid 3 and commits (rowid 3 was rolled back by db1 → no conflict)
+# db1 commits: should succeed for rowid 3; rowids 1 and 2 are still held.
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 5.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+    }
+    code1 { db eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 5.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(1, 'outer');
+        SAVEPOINT s1;
+          INSERT INTO t1 VALUES(2, 'inner1');
+          SAVEPOINT s2;
+            INSERT INTO t1 VALUES(3, 'inner2');
+          ROLLBACK TO s2;
+          RELEASE s2;
+        RELEASE s1;
+    }
+  } {}
+
+  # db2 commits a write to rowid 3 (which db1 rolled back).
+  do_test 5.$tn.2 {
+    sql2 {
+      BEGIN CONCURRENT;
+        INSERT INTO t1 VALUES(3, 'db2');
+      COMMIT;
+    }
+  } {}
+
+  # db1 should commit cleanly (rowid 3 was removed from its lock set).
+  # Cross-process sidecar load enables row-level check for tn=1 too; the
+  # rolled-back rowid 3 is not in db1's write set, so no conflict.
+  do_test 5.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    code1 { list $::rc [sqlite3_extended_errcode db] }
+  } {0 SQLITE_OK}
+
+  do_test 5.$tn.4 {
+    sql1 { SELECT k, v FROM t1 ORDER BY k }
+  } {1 outer 2 inner1 3 db2}
+
+} ;# do_multiclient_test
+
+finish_test

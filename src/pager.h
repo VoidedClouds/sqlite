@@ -256,6 +256,19 @@ int sqlite3PagerIsWal(Pager*);
 # define sqlite3PagerUsePage(x, y) SQLITE_OK
 #endif
 
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/* Row-level locking pager bridge functions */
+void sqlite3PagerSetReadRowSet(Pager *pPager, RowLockSet *pRowLocks);
+int  sqlite3PagerRowLogCount(Pager *pPager);
+/* Return the WAL object for this pager (needed for merge-page access) */
+struct Wal *sqlite3PagerGetWal(Pager *pPager);
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING */
+
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+/* Set read-committed isolation mode on the pager's WAL connection */
+void sqlite3PagerSetReadCommitted(Pager *pPager, int bRC);
+#endif /* SQLITE_ENABLE_READ_ISOLATION */
+
 #if defined(SQLITE_DEBUG) || !defined(SQLITE_OMIT_CONCURRENT)
 int sqlite3PagerIswriteable(DbPage*);
 #endif

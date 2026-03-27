@@ -145,7 +145,71 @@ int sqlite3WalLockForCommit(Wal *pWal, PgHdr *pPg, Bitvec *pRead, u32*);
 /* Upgrade the state of the client to take into account changes written
 ** by other connections */
 int sqlite3WalUpgradeSnapshot(Wal *pWal);
+
+/*
+** Two-phase concurrent commit: pre-check (no write lock) + delta check
+** (write lock, narrow scan).
+**
+** WalPreCheckCtx is an opaque fixed-size context passed from
+** sqlite3WalPreCheck() to sqlite3WalDeltaCheck().  It stores a snapshot
+** of the WAL index header captured at pre-check time.  The size must
+** equal sizeof(WalIndexHdr) — enforced by a compile-time assert in wal.c.
+** Stack-allocate only; do not heap-allocate or memset.
+*/
+#define WAL_PRECHECK_CTX_NDATA 12   /* sizeof(WalIndexHdr) / sizeof(u32) */
+typedef struct WalPreCheckCtx {
+  u32 aData[WAL_PRECHECK_CTX_NDATA];
+} WalPreCheckCtx;
+
+/*
+** Phase 1: scan WAL frames for conflicts without holding the write lock.
+** Uses the caller's existing read lock.  On SQLITE_OK, *pCtx is filled
+** with the WAL header state captured during the scan; pass it unchanged to
+** sqlite3WalDeltaCheck().  On SQLITE_BUSY_SNAPSHOT, a conflict was found
+** and the caller should abort the transaction without retrying.
+*/
+int sqlite3WalPreCheck(Wal*, PgHdr*, Bitvec*, WalPreCheckCtx*, u32*);
+
+/*
+** Phase 2: acquire the write lock and scan only frames written since the
+** pre-check.  On SQLITE_OK the write lock is held and the caller must
+** write frames then call sqlite3WalEndWriteTransaction().  On SQLITE_BUSY
+** the lock was temporarily unavailable (caller may retry with busy-handler).
+** On SQLITE_BUSY_SNAPSHOT a genuine conflict was found (do not retry).
+*/
+int sqlite3WalDeltaCheck(Wal*, PgHdr*, Bitvec*, const WalPreCheckCtx*, u32*);
 #endif /* SQLITE_OMIT_CONCURRENT */
+
+#if defined(SQLITE_ENABLE_ROW_LEVEL_LOCKING) && !defined(SQLITE_OMIT_CONCURRENT)
+/* Row-level locking WAL integration */
+/*
+** Describes one page that needs a 3-way cell merge at commit time.
+** Recorded by walLockForCommit() when RLL allows two concurrent transactions
+** to write different rows to the same physical B-tree leaf page.
+*/
+struct WalMergePage {
+  Pgno                    pgno;    /* Page number to be merged */
+  u32                     iFrame;  /* WAL frame holding the concurrent version */
+  struct RowLockSet      *pRows;   /* Rows written by concurrent transaction */
+  struct WalMergePage    *pNext;   /* Linked list */
+};
+void sqlite3WalSetReadRowSet(Wal *pWal, RowLockSet *pRowLocks);
+void sqlite3WalRecordCommitRows(Wal *pWal, RowLockSet *pRows,
+                                u32 iMinFrame, u32 iMaxFrame);
+u32  sqlite3WalGetMxFrame(Wal *pWal);
+int  sqlite3WalGetRowLogCount(Wal *pWal);
+void sqlite3WalTrimCommitRows(Wal *pWal, int iWal, u32 nBackfill);
+/* 3-way merge page list: pages where RLL allowed both txns to write */
+struct WalMergePage *sqlite3WalGetMergePages(Wal *pWal);
+void sqlite3WalClearMergePages(Wal *pWal);
+#endif /* SQLITE_ENABLE_ROW_LEVEL_LOCKING */
+
+#if defined(SQLITE_ENABLE_READ_ISOLATION) && !defined(SQLITE_OMIT_CONCURRENT)
+/* Set read-committed isolation mode on this WAL connection. When bRC is
+** true, page-level read-only conflicts are skipped (only write-write
+** conflicts are detected). */
+void sqlite3WalSetReadCommitted(Wal *pWal, int bRC);
+#endif /* SQLITE_ENABLE_READ_ISOLATION */
 
 #ifdef SQLITE_ENABLE_ZIPVFS
 /* If the WAL file is not empty, return the number of bytes of content

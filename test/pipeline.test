@@ -1,0 +1,473 @@
+# 2026 March 25
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for the Phase P0 parallel commit pipeline:
+#   walPreCheck (pre-check without write lock) + walDeltaCheck (narrow delta).
+#
+# Verified behaviours:
+#   1.x  Single-connection CONCURRENT commits work correctly.
+#   2.x  Non-conflicting multi-client writes succeed (no false BUSY_SNAPSHOT).
+#   3.x  Conflicting multi-client writes still fail with SQLITE_BUSY_SNAPSHOT.
+#   4.x  Pre-check handles a busy WAL (many frames since snapshot).
+#   5.x  Read-committed isolation preserves read-write non-conflict semantics.
+#   6.x  Savepoint + pipeline interaction is correct.
+#   7.x  Schema changes conflict with everything.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/lock_common.tcl
+reset_db
+set ::testprefix pipeline
+
+ifcapable !concurrent {
+  finish_test
+  return
+}
+
+# Detect SQLITE_ENABLE_ROW_LEVEL_LOCKING at runtime.
+set ::has_rll 0
+catch {
+  db eval { PRAGMA row_level_locking = 1 }
+  db eval { PRAGMA row_level_locking = 0 }
+  set ::has_rll 1
+}
+
+#--------------------------------------------------------------------------
+# Section 1: Single-connection CONCURRENT — basic pipeline sanity
+# (runs first, while db is still open from reset_db)
+#--------------------------------------------------------------------------
+
+do_execsql_test 1.1 {
+  PRAGMA journal_mode = wal;
+  CREATE TABLE t1(k INTEGER PRIMARY KEY, v TEXT);
+  INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+} {wal}
+
+do_test 1.2 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t1 VALUES(10, 'ten');
+    COMMIT;
+  }
+  db eval { SELECT k FROM t1 ORDER BY k }
+} {1 2 3 10}
+
+do_test 1.3 {
+  db eval {
+    BEGIN CONCURRENT; INSERT INTO t1 VALUES(20, 'twenty'); COMMIT;
+    BEGIN CONCURRENT; INSERT INTO t1 VALUES(30, 'thirty');  COMMIT;
+  }
+  db eval { SELECT k FROM t1 ORDER BY k }
+} {1 2 3 10 20 30}
+
+#--------------------------------------------------------------------------
+# Section 4: Pre-check handles a WAL with many committed frames
+# (runs before the multiclient sections so db is still valid)
+#--------------------------------------------------------------------------
+
+do_test 4.setup {
+  db eval {
+    DROP TABLE IF EXISTS t4;
+    CREATE TABLE t4(k INTEGER PRIMARY KEY, v BLOB);
+  }
+  for {set i 1} {$i <= 50} {incr i} {
+    db eval { INSERT INTO t4 VALUES($i, randomblob(128)) }
+  }
+  db eval { SELECT count(*) FROM t4 }
+} {50}
+
+do_test 4.1 {
+  catch { db eval ROLLBACK }
+  db eval { BEGIN CONCURRENT }
+  # Open a second connection to grow the WAL by one frame.
+  sqlite3 tmpdb test.db
+  tmpdb eval { INSERT INTO t4 VALUES(51, randomblob(128)) }
+  tmpdb close
+  set rc [catch {
+    db eval { INSERT INTO t4 VALUES(99, 'pipeline-test'); COMMIT; }
+  } msg]
+  list $rc $msg
+} {0 {}}
+
+do_test 4.2 {
+  db eval { SELECT count(*) FROM t4 }
+} {52}
+
+#--------------------------------------------------------------------------
+# Section 6: Savepoint + pipeline
+# (also before multiclient so db is valid)
+#--------------------------------------------------------------------------
+
+do_test 6.setup {
+  db eval {
+    DROP TABLE IF EXISTS t6;
+    CREATE TABLE t6(k INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t6 VALUES(1,'a'),(2,'b');
+  }
+} {}
+
+do_test 6.1 {
+  db eval {
+    BEGIN CONCURRENT;
+      INSERT INTO t6 VALUES(10, 'ten');
+      SAVEPOINT sp1;
+        INSERT INTO t6 VALUES(11, 'eleven');
+      ROLLBACK TO sp1;
+      INSERT INTO t6 VALUES(20, 'twenty');
+    COMMIT;
+  }
+  db eval { SELECT k FROM t6 ORDER BY k }
+} {1 2 10 20}
+
+#--------------------------------------------------------------------------
+# Section 2: Multi-client — non-overlapping writes must not conflict
+#--------------------------------------------------------------------------
+
+if { $::has_rll } {
+
+do_multiclient_test tn {
+
+  do_test 2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t2(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t2 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 2.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t2 VALUES(100, 'hundred'); }
+  } {}
+
+  do_test 2.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t2 VALUES(200, 'twohundred'); COMMIT; }
+  } {}
+
+  do_test 2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 2.$tn.4 {
+    sql1 { SELECT k FROM t2 ORDER BY k }
+  } {1 2 3 4 5 100 200}
+
+} ;# do_multiclient_test
+
+} ;# has_rll
+
+#--------------------------------------------------------------------------
+# Section 3: Multi-client — overlapping writes must conflict
+#--------------------------------------------------------------------------
+
+if { $::has_rll } {
+
+do_multiclient_test tn {
+
+  do_test 3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t3(k INTEGER PRIMARY KEY, v TEXT);
+    }
+    code1 { db  eval { PRAGMA row_level_locking = 1 } }
+    code2 { db2 eval { PRAGMA row_level_locking = 1 } }
+  } {}
+
+  do_test 3.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t3 VALUES(99, 'db1'); }
+  } {}
+
+  do_test 3.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t3 VALUES(99, 'db2'); COMMIT; }
+  } {}
+
+  do_test 3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc \
+         [code1 { sqlite3_extended_errcode db }] \
+         [code1 { sqlite3_get_autocommit db }]
+  } {1 SQLITE_BUSY_SNAPSHOT 0}
+
+  do_test 3.$tn.4 { sql1 ROLLBACK } {}
+
+  do_test 3.$tn.5 {
+    sql1 { SELECT v FROM t3 WHERE k=99 }
+  } {db2}
+
+} ;# do_multiclient_test
+
+} ;# has_rll
+
+#--------------------------------------------------------------------------
+# Section 5: Read-committed isolation + pipeline
+#--------------------------------------------------------------------------
+
+if { $::has_rll } {
+
+do_multiclient_test tn {
+
+  do_test 5.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t5(k INTEGER PRIMARY KEY, v TEXT);
+      DELETE FROM t5;
+      INSERT INTO t5 VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA isolation_level = read_committed }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+      db2 eval { PRAGMA isolation_level = read_committed }
+    }
+    set x {}
+  } {}
+
+  do_test 5.$tn.1 {
+    sql1 { BEGIN CONCURRENT; SELECT v FROM t5 WHERE k=1; }
+  } {a}
+
+  do_test 5.$tn.2 {
+    sql2 { BEGIN CONCURRENT; UPDATE t5 SET v='A' WHERE k=1; COMMIT; }
+  } {}
+
+  # Under read_committed, db1's READ of k=1 is NOT a conflict.
+  do_test 5.$tn.3 {
+    sql1 { INSERT INTO t5 VALUES(50, 'rc-pipeline'); }
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc $msg
+  } {0 {}}
+
+  do_test 5.$tn.4 {
+    sql1 { SELECT v FROM t5 WHERE k=1 }
+  } {A}
+
+} ;# do_multiclient_test
+
+} ;# has_rll
+
+#--------------------------------------------------------------------------
+# Section 7: Schema changes conflict with everything
+#--------------------------------------------------------------------------
+
+do_multiclient_test tn {
+
+  do_test 7.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE IF NOT EXISTS t7(k INTEGER PRIMARY KEY, v TEXT);
+    }
+    set x {}
+  } {}
+
+  do_test 7.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t7 VALUES(1, 'one'); }
+  } {}
+
+  do_test 7.$tn.2 {
+    sql2 { BEGIN CONCURRENT; CREATE TABLE t7b(x INTEGER); COMMIT; }
+  } {}
+
+  do_test 7.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }]
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  do_test 7.$tn.4 { sql1 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+
+#--------------------------------------------------------------------------
+# Section 8: Pipeline correctness when row-level data is degraded
+#
+# The bNeedSidecar mechanism must never introduce false-OK results.
+# Three sub-scenarios are verified:
+#
+#   8.1  RLL disabled at runtime (PRAGMA row_level_locking=0).
+#        pCurReadRows=NULL → the #if(pWal->pCurReadRows) block is skipped
+#        entirely → bNeedSidecar is never set → pre-check uses pure page-level
+#        detection.  A genuine conflict must still produce SQLITE_BUSY_SNAPSHOT.
+#
+#   8.2  RowLockSet spilled, both connections threshold=1 (db1 inserts 2 rows,
+#        db2 inserts 1 row).
+#        threshold=1 means exactly ONE distinct row is tracked before spill.
+#        db1 inserts 2 rows → bSpilled=1.  db2 inserts 1 row → NOT spilled
+#        (nEntry(0) < nThreshold(1); the spill check fires on the 2nd insert).
+#        db2's WalCommitRowSet has bSpilled=0 and holds row 30.
+#
+#        Same-process (tn=2): walFindCommitRowSet finds pCRS in the pre-check
+#        (db2's commit lives in the shared pLog->pCommits); the else-if(bPreCheck)
+#        branch is NOT taken; bNeedSidecar NOT set; rowLockSetHasConflict returns
+#        -1 (pMine->bSpilled) → BUSY_SNAPSHOT from pre-check; delta check not called.
+#
+#        Cross-process (tn=1): walFindCommitRowSet returns NULL in the pre-check
+#        (db2's commit is in a different process); bNeedSidecar=1 set; pCtx reset;
+#        pre-check returns SQLITE_OK.  Delta check: sidecar delivers db2's non-
+#        spilled set; rowLockSetHasConflict returns -1 (pMine->bSpilled) →
+#        BUSY_SNAPSHOT from the delta check.
+#
+#   8.3  RowLockSet spilled in both connections (threshold=0, both connections RLL).
+#        threshold=0 means bSpilled=1 fires on the very first rowLockSetInsert call
+#        — ZERO rows are ever tracked.  Both committed RowLockSets have bSpilled=1.
+#
+#        Same-process (tn=2): walFindCommitRowSet finds pCRS in the pre-check
+#        (db2's spilled set in pLog->pCommits); rowLockSetHasConflict returns -1
+#        (pCommit->bSpilled) → BUSY_SNAPSHOT from pre-check; bNeedSidecar NOT set;
+#        delta check not called.
+#
+#        Cross-process (tn=1): pCRS=NULL in pre-check (sidecar not loaded) →
+#        bNeedSidecar=1, pCtx reset → SQLITE_OK returned.  Delta check:
+#        walSidecarLoad runs → pCRS found with bSpilled=1 →
+#        rowLockSetHasConflict=-1 → SQLITE_BUSY_SNAPSHOT.
+#        A false-OK here would be a critical correctness bug.
+#--------------------------------------------------------------------------
+
+#-------- 8.1: RLL disabled at runtime ------------------------------------
+do_multiclient_test tn {
+
+  do_test 8.1.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8a(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t8a VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    set x {}
+  } {}
+
+  do_test 8.1.$tn.1 {
+    sql1 { BEGIN CONCURRENT; SELECT count(*) FROM t8a; }
+  } {3}
+
+  do_test 8.1.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t8a VALUES(10,'ten'); COMMIT; }
+  } {}
+
+  # pCurReadRows=NULL → bNeedSidecar never set → pre-check detects page conflict.
+  do_test 8.1.$tn.3 {
+    sql1 { INSERT INTO t8a VALUES(20,'twenty'); }
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }]
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  do_test 8.1.$tn.4 { sql1 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+#-------- 8.2: RowLockSet spilled (threshold=1 on both, db1 inserts 2 rows) ------
+if { $::has_rll } {
+
+do_multiclient_test tn {
+
+  do_test 8.2.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8b(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t8b VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 1 }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+      db2 eval { PRAGMA row_lock_threshold = 1 }
+    }
+    set {} {}
+  } {}
+
+  do_test 8.2.$tn.1 {
+    sql1 {
+      BEGIN CONCURRENT;
+        INSERT INTO t8b VALUES(10,'ten');
+        INSERT INTO t8b VALUES(20,'twenty');
+    }
+  } {}
+
+  do_test 8.2.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t8b VALUES(30,'thirty'); COMMIT; }
+  } {}
+
+  # Both connections have threshold=1; db1 inserted 2 rows (bSpilled=1),
+  # db2 inserted 1 row (NOT spilled — 1 row is within the threshold=1 limit).
+  # rowLockSetHasConflict returns -1 (pMine->bSpilled) regardless of pCRS.
+  # Same-process (tn=2): pCRS found in pre-check → BUSY_SNAPSHOT from pre-check;
+  #   bNeedSidecar NOT set; delta check not called.
+  # Cross-process (tn=1): pCRS=NULL in pre-check → bNeedSidecar=1 → delta check;
+  #   sidecar delivers db2's non-spilled set; still -1 (pMine spilled) → BUSY_SNAPSHOT.
+  do_test 8.2.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }]
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  do_test 8.2.$tn.4 { sql1 ROLLBACK } {}
+
+} ;# do_multiclient_test
+
+} ;# has_rll
+
+#-------- 8.3: Both RowLockSets spilled (threshold=0, both connections RLL) ------
+if { $::has_rll } {
+
+do_multiclient_test tn {
+
+  do_test 8.3.$tn.setup {
+    sql1 {
+      PRAGMA journal_mode = wal;
+      CREATE TABLE t8c(k INTEGER PRIMARY KEY, v TEXT);
+      INSERT INTO t8c VALUES(1,'a'),(2,'b'),(3,'c');
+    }
+    code1 {
+      db eval { PRAGMA row_level_locking = 1 }
+      db eval { PRAGMA row_lock_threshold = 0 }
+    }
+    code2 {
+      db2 eval { PRAGMA row_level_locking = 1 }
+      db2 eval { PRAGMA row_lock_threshold = 0 }
+    }
+    set x {}
+  } {}
+
+  do_test 8.3.$tn.1 {
+    sql1 { BEGIN CONCURRENT; INSERT INTO t8c VALUES(10,'ten'); }
+  } {}
+
+  do_test 8.3.$tn.2 {
+    sql2 { BEGIN CONCURRENT; INSERT INTO t8c VALUES(11,'eleven'); COMMIT; }
+  } {}
+
+  # threshold=0: bSpilled=1 on the very first insert — zero rows tracked.
+  # Both committed RowLockSets have bSpilled=1; rowLockSetHasConflict returns -1.
+  # Same-process (tn=2): pCRS found in pre-check (db2's spilled set in pCommits);
+  #   rowLockSetHasConflict=-1 (pCommit->bSpilled) → BUSY_SNAPSHOT from pre-check;
+  #   bNeedSidecar NOT set; delta check not called.
+  # Cross-process (tn=1): pCRS=NULL in pre-check → bNeedSidecar=1 → pCtx reset →
+  #   SQLITE_OK.  Delta check: sidecar → pCRS found with bSpilled=1 →
+  #   rowLockSetHasConflict=-1 → BUSY_SNAPSHOT.
+  # A false-OK here (missing the conflict) would be a critical correctness bug.
+  do_test 8.3.$tn.3 {
+    set rc [catch { sql1 COMMIT } msg]
+    list $rc [code1 { sqlite3_extended_errcode db }]
+  } {1 SQLITE_BUSY_SNAPSHOT}
+
+  do_test 8.3.$tn.4 { sql1 ROLLBACK } {}
+
+  do_test 8.3.$tn.5 {
+    sql1 { SELECT k FROM t8c ORDER BY k }
+  } {1 2 3 11}
+
+} ;# do_multiclient_test
+
+} ;# has_rll
+
+finish_test
